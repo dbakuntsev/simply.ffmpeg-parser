@@ -1,1 +1,4 @@
 node_modules
+public/metadata/ffmpeg/*/
+public/doc/ffmpeg/*
+.vite/
