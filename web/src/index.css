@@ -1,0 +1,62 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes drawer-slide-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@layer base {
+  body {
+    @apply font-sans text-ink bg-[#f6f1ea];
+    background:
+      radial-gradient(circle at 15% 10%, #ffe8c2 0%, transparent 45%),
+      radial-gradient(circle at 85% 15%, #cde6ff 0%, transparent 50%),
+      linear-gradient(135deg, #f6f1ea 0%, #f7f5f2 100%);
+  }
+}
+
+@layer components {
+  /* Markdown rendered into popovers. The extractor emits paragraphs, fenced
+     code, bullet/numbered lists, and definition-style **term**\n\nbody rows. */
+  .popover-md > * + * {
+    @apply mt-2;
+  }
+  .popover-md p {
+    @apply leading-snug;
+  }
+  .popover-md code {
+    @apply rounded-[3px] bg-edge/60 px-1 py-0.5 font-mono text-[12px];
+  }
+  .popover-md pre {
+    @apply overflow-x-auto rounded-[3px] bg-edge/40 p-2 text-[12px];
+  }
+  .popover-md pre code {
+    @apply bg-transparent p-0 text-[12px];
+  }
+  .popover-md ul {
+    @apply list-disc pl-5;
+  }
+  .popover-md ol {
+    @apply list-decimal pl-5;
+  }
+  .popover-md li + li {
+    @apply mt-1;
+  }
+  .popover-md li > p {
+    @apply m-0;
+  }
+  .popover-md a {
+    @apply text-blue-700 hover:underline;
+  }
+  .popover-md strong {
+    @apply font-semibold text-ink;
+  }
+  .popover-md em {
+    @apply italic;
+  }
+  .popover-md blockquote {
+    @apply border-l-2 border-edge pl-2 text-muted;
+  }
+}

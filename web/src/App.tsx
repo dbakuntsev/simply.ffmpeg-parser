@@ -1,0 +1,115 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CommandInput } from "./components/CommandInput";
+import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
+import { FlowChart } from "./components/FlowChart";
+import { SelectionPanel } from "./components/SelectionPanel";
+import { SummaryStrip } from "./components/SummaryStrip";
+import { TreeList } from "./components/TreeList";
+import { VersionSelector } from "./components/VersionSelector";
+import { useMetadata } from "./hooks/useMetadata";
+import { useSelection } from "./hooks/useSelection";
+import { analyzeCommand, buildFlowNodes, buildTreeNodes } from "./parser";
+import { buildSelectionInfo } from "./selection";
+import type { Issue } from "./types";
+
+const SAMPLE = `ffmpeg -i input.mp4 -vf "scale=1280:-1" -c:v libx264 -c:a aac output.mp4`;
+const ANALYZE_DEBOUNCE_MS = 500;
+
+export default function App() {
+  const [command, setCommand] = useState(SAMPLE);
+  const [submitted, setSubmitted] = useState(SAMPLE);
+  const { versions, version, setVersion, metadata } = useMetadata();
+  const { selectedNode, select, clear } = useSelection();
+
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Debounced auto-analyze
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setSubmitted(command.trim());
+    }, ANALYZE_DEBOUNCE_MS);
+    return () => window.clearTimeout(handle);
+  }, [command]);
+
+  const analysis = useMemo(() => {
+    if (!metadata) return null;
+    return analyzeCommand(submitted, metadata);
+  }, [submitted, metadata]);
+
+  const issues = analysis?.issues ?? [];
+  const flow = useMemo(
+    () => (analysis ? buildFlowNodes(analysis.semantic) : { nodes: [], links: [] }),
+    [analysis]
+  );
+  const treeNodes = useMemo(() => (analysis ? buildTreeNodes(analysis.semantic) : []), [analysis]);
+
+  const selectionInfo = useMemo(
+    () => (analysis && metadata ? buildSelectionInfo(analysis, metadata, version) : new Map()),
+    [analysis, metadata, version]
+  );
+  const selection = selectedNode ? selectionInfo.get(selectedNode) ?? null : null;
+
+  const handleIssueClick = (issue: Issue) => {
+    if (!analysis || !textareaRef.current) return;
+    const tokenId = issue.tokenIds[0];
+    const token = analysis.tokens.find((t) => t.id === tokenId);
+    if (!token) return;
+    const { start, end } = token.sourceRange;
+    const el = textareaRef.current;
+    el.focus();
+    el.setSelectionRange(start, end);
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  };
+
+  return (
+    <div
+      className={`lg:h-screen lg:overflow-y-auto ${selection ? "lg:mr-[30rem]" : ""}`}
+      style={{ transition: "margin 100ms cubic-bezier(0, 0, 0.2, 1)" }}
+    >
+    <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8 overflow-x-hidden">
+      <header className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+        <div className="flex flex-col gap-3">
+          <h1 className="text-3xl font-semibold tracking-tight text-ink">Simply FFmpeg Parser</h1>
+          <p className="max-w-2xl text-sm text-muted">
+            Explore FFmpeg commands without running the binary. This SPA tokenizes, resolves scope, detects issues, and
+            visualizes the flow.
+          </p>
+        </div>
+        <VersionSelector versions={versions} version={version} onChange={setVersion} />
+      </header>
+
+      <CommandInput ref={textareaRef} command={command} onCommandChange={setCommand} />
+
+      <DiagnosticsPanel issues={issues} onIssueClick={handleIssueClick} />
+
+      <section className="rounded-[3px] border border-edge bg-panel p-5 shadow-panel">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Visualization</div>
+        </div>
+        <div className="mt-3">
+          <SummaryStrip semantic={analysis?.semantic ?? null} />
+        </div>
+        <div className="mt-4 grid gap-4">
+          <FlowChart
+            nodes={flow.nodes}
+            links={flow.links}
+            selectedNode={selectedNode}
+            onSelect={select}
+          />
+          <div className="max-h-[520px] overflow-auto rounded-[3px] border border-edge bg-white/70 p-3">
+            <TreeList
+              nodes={treeNodes}
+              selected={selectedNode}
+              onSelect={select}
+            />
+          </div>
+        </div>
+      </section>
+
+      {selection && (
+        <SelectionPanel selection={selection} onClose={clear} />
+      )}
+    </div>
+    </div>
+  );
+}

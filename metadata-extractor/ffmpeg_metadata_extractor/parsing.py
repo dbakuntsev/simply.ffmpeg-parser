@@ -1,0 +1,1000 @@
+"""Parse FFmpeg metadata from the XML emitted by ``makeinfo --xml``.
+
+The texi sources are processed by :mod:`.texi_xml`, which returns an
+ElementTree root. This module walks that tree to produce
+:class:`OptionEntry` / :class:`CodecEntry` / :class:`FilterEntry` records.
+
+Description fields are rendered as a list of Markdown paragraph strings —
+the same shape the SPA already consumes.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import replace
+from xml.etree import ElementTree as ET
+
+from .models import CodecEntry, FilterEntry, NamedEntry, OptionEntry
+
+
+# === Markdown rendering of makeinfo XML ============================
+
+_MD_SPECIALS = r"\`*_[]"
+
+
+def _md_escape(text: str) -> str:
+    out: list[str] = []
+    for ch in text:
+        if ch in _MD_SPECIALS:
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+
+# Inline tags that render as a Markdown code span.
+_CODE_TAGS = {
+    "code", "command", "option", "samp", "file", "kbd", "key",
+    "verb", "env", "t", "indicateurl",
+}
+# Inline tags that render as Markdown emphasis (italic).
+_EM_TAGS = {"var", "emph", "i", "cite", "dfn"}
+# Inline tags that render as Markdown strong (bold).
+_STRONG_TAGS = {"strong", "b"}
+# Pure passthrough wrappers — render content as-is.
+_PASSTHROUGH_TAGS = {
+    "math", "asis", "w", "sc", "sansserif", "r", "value",
+    "itemformat", "para", "phrase",
+}
+# Inline tags whose content should be dropped entirely.
+_DROP_INLINE_TAGS = {
+    "anchor", "indexterm", "hyphenation", "errormsg",
+    "set", "clear", "comment", "c",
+}
+
+
+def _plain_text(elem: ET.Element) -> str:
+    """Recursively collect the text content of ``elem`` (no Markdown markup)."""
+    parts: list[str] = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in elem:
+        if child.tag in _DROP_INLINE_TAGS:
+            pass
+        else:
+            parts.append(_plain_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
+def _wrap_code(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+    if "`" in text:
+        return f"`` {text} ``"
+    return f"`{text}`"
+
+
+def _render_inline(elem: ET.Element) -> str:
+    """Render the inline (mixed) content of ``elem`` as Markdown."""
+    parts: list[str] = []
+    if elem.text:
+        parts.append(_md_escape(elem.text))
+    for child in elem:
+        parts.append(_render_inline_child(child))
+        if child.tail:
+            parts.append(_md_escape(child.tail))
+    return "".join(parts)
+
+
+def _render_inline_child(elem: ET.Element) -> str:
+    tag = elem.tag
+    if tag in _DROP_INLINE_TAGS:
+        return ""
+    if tag in _CODE_TAGS:
+        return _wrap_code(_plain_text(elem))
+    if tag in _EM_TAGS:
+        inner = _render_inline(elem).strip()
+        return f"*{inner}*" if inner else ""
+    if tag in _STRONG_TAGS:
+        inner = _render_inline(elem).strip()
+        return f"**{inner}**" if inner else ""
+    if tag in _PASSTHROUGH_TAGS:
+        return _render_inline(elem)
+    if tag in ("uref", "url"):
+        return _render_uref(elem)
+    if tag == "email":
+        return _render_email(elem)
+    if tag in ("ref", "xref", "pxref", "inforef"):
+        return _render_xref(elem, tag)
+    if tag == "linebreak":
+        return "\n"
+    # Unknown element — recurse so we don't drop meaningful text.
+    return _render_inline(elem)
+
+
+def _child_text(elem: ET.Element | None, child_tag: str) -> str:
+    if elem is None:
+        return ""
+    child = elem.find(child_tag)
+    if child is None:
+        return ""
+    return _plain_text(child).strip()
+
+
+def _render_uref(elem: ET.Element) -> str:
+    url = _child_text(elem, "urefurl")
+    desc = _child_text(elem, "urefdesc") or _child_text(elem, "urefreplacement")
+    if not url:
+        # @url{some text} without a real URL — just return the text.
+        return _md_escape(_plain_text(elem).strip())
+    if not desc or desc == url:
+        return f"<{url}>"
+    return f"[{_md_escape(desc)}]({url})"
+
+
+def _render_email(elem: ET.Element) -> str:
+    addr = _child_text(elem, "emailaddress")
+    name = _child_text(elem, "emailname")
+    if not addr:
+        return _md_escape(_plain_text(elem).strip())
+    if not name or name == addr:
+        return f"<{addr}>"
+    return f"[{_md_escape(name)}](mailto:{addr})"
+
+
+def _render_xref(elem: ET.Element, tag: str) -> str:
+    label = (
+        _child_text(elem, "xrefprinteddesc")
+        or _child_text(elem, "xrefinfoname")
+        or _child_text(elem, "xrefprintedname")
+        or _child_text(elem, "xrefnodename")
+    )
+    if not label:
+        return ""
+    rendered = f"*{_md_escape(label)}*"
+    if tag == "xref":
+        return f"See {rendered}"
+    if tag == "pxref":
+        return f"see {rendered}"
+    return rendered
+
+
+# --- Block rendering ----------------------------------------------------
+
+# Tags inside a section/chapter that are decorative or layout-only.
+_BLOCK_SKIP_TAGS = {
+    "sectiontitle", "anchor", "indexterm", "noindent", "page", "sp",
+    "menu", "detailmenu", "direntry", "copying", "titlepage",
+    "printindex", "shorttitlepage", "subtitle", "author",
+    "itemprepend", "beforefirstitem", "formattingcommand", "filename",
+    "setfilename", "settitle", "set", "clear", "comment", "c",
+    "node", "nodename", "nodenext", "nodeprev", "nodeup",
+}
+
+
+def _render_paragraphs(elem: ET.Element) -> list[str]:
+    """Render the block-level children of ``elem`` into Markdown paragraphs."""
+    paragraphs: list[str] = []
+    for child in elem:
+        rendered = _render_block(child)
+        if rendered:
+            paragraphs.append(rendered)
+    return paragraphs
+
+
+def _render_block(elem: ET.Element) -> str:
+    tag = elem.tag
+    if tag in _BLOCK_SKIP_TAGS:
+        return ""
+    if tag == "para":
+        text = _render_inline(elem).strip()
+        return text
+    if tag in ("example", "smallexample", "display", "format", "lisp"):
+        return _render_pre(elem)
+    if tag == "verbatim":
+        return _render_verbatim(elem)
+    if tag in ("itemize", "enumerate"):
+        return _render_list(elem, tag)
+    if tag in ("table", "vtable", "ftable", "multitable"):
+        return _render_table(elem)
+    if tag in ("quotation", "smallquotation"):
+        return _render_quotation(elem)
+    if tag in ("group", "cartouche"):
+        return "\n\n".join(_render_paragraphs(elem))
+    # Sub-chapters/sections inside a description — flatten their content.
+    if tag in ("section", "subsection", "subsubsection", "chapter", "appendix"):
+        return "\n\n".join(_render_paragraphs(elem))
+    # Inline-style element appearing at block level — wrap as a paragraph.
+    if tag in _CODE_TAGS or tag in _EM_TAGS or tag in _STRONG_TAGS:
+        return _render_inline_child(elem)
+    # Unknown block — try to render children.
+    return "\n\n".join(_render_paragraphs(elem))
+
+
+def _render_pre(elem: ET.Element) -> str:
+    pre = elem.find("pre")
+    body = (pre.text if pre is not None else _plain_text(elem)) or ""
+    body = body.strip("\n")
+    if not body:
+        return ""
+    return f"```\n{body}\n```"
+
+
+def _render_verbatim(elem: ET.Element) -> str:
+    body = (elem.text or "").strip("\n")
+    if not body:
+        return ""
+    return f"```\n{body}\n```"
+
+
+def _render_list(elem: ET.Element, kind: str) -> str:
+    items = elem.findall("listitem")
+    rendered: list[str] = []
+    for idx, item in enumerate(items, start=1):
+        paragraphs = _render_paragraphs(item)
+        if not paragraphs:
+            continue
+        marker = f"{idx}. " if kind == "enumerate" else "- "
+        indent = " " * len(marker)
+        first, *rest = paragraphs
+        chunk = [marker + first.replace("\n", "\n" + indent)]
+        for para in rest:
+            chunk.append("")
+            chunk.append(indent + para.replace("\n", "\n" + indent))
+        rendered.append("\n".join(chunk))
+    return "\n".join(rendered)
+
+
+def _render_table(elem: ET.Element) -> str:
+    rendered: list[str] = []
+    for entry in elem.findall("tableentry"):
+        term_parts = _table_terms(entry)
+        if not term_parts:
+            continue
+        body_paragraphs: list[str] = []
+        for item in entry.findall("tableitem"):
+            body_paragraphs.extend(_render_paragraphs(item))
+        term_line = " · ".join(f"**{t}**" for t in term_parts)
+        if body_paragraphs:
+            body = "\n\n".join(body_paragraphs)
+            rendered.append(f"{term_line}  \n{body}")
+        else:
+            rendered.append(term_line)
+    return "\n\n".join(rendered)
+
+
+def _table_terms(entry: ET.Element) -> list[str]:
+    terms: list[str] = []
+    for term_container in entry.findall("tableterm"):
+        for item in list(term_container):
+            if item.tag not in ("item", "itemx"):
+                continue
+            text = _render_inline(item).strip()
+            if text:
+                terms.append(text)
+    return terms
+
+
+def _render_quotation(elem: ET.Element) -> str:
+    paragraphs = _render_paragraphs(elem)
+    if not paragraphs:
+        return ""
+    body = "\n\n".join(paragraphs)
+    return "\n".join(f"> {ln}" if ln else ">" for ln in body.split("\n"))
+
+
+# === Helpers for tree traversal ====================================
+
+_SECTION_TAGS = {
+    "chapter", "section", "subsection", "subsubsection",
+    "appendix", "appendixsec", "appendixsubsec", "unnumbered",
+    "unnumberedsec", "unnumberedsubsec", "top",
+}
+
+
+def _section_title(section: ET.Element) -> str:
+    title = section.find("sectiontitle")
+    if title is None:
+        return ""
+    return _plain_text(title).strip()
+
+
+def _normalize_name(value: str) -> str:
+    return value.strip().lower()
+
+
+# === Options =======================================================
+
+_OPTION_NAME_RE = re.compile(r"(-{1,2}[A-Za-z0-9][A-Za-z0-9:._-]*)")
+
+
+def _scope_for_section(title: str, current: str) -> str:
+    lower = title.lower()
+    if "input" in lower:
+        return "input"
+    if "output" in lower:
+        return "output"
+    if "global" in lower or "generic" in lower:
+        return "global"
+    return current
+
+
+def _trailing_anchor(entry: ET.Element) -> str | None:
+    """Return the ``@anchor{}`` name placed between this entry and the next.
+
+    Texi convention places fine-grained anchors before an ``@item`` (e.g.
+    ``@anchor{filter_option}\\n@item -filter ...``). Makeinfo's XML emits that
+    anchor as a trailing child of the *previous* ``<tableitem>``, so it has
+    to be carried forward to the next entry. Returns ``None`` when no
+    trailing anchor is present.
+    """
+    last_item = None
+    for child in entry:
+        if child.tag == "tableitem":
+            last_item = child
+    if last_item is None:
+        return None
+    children = list(last_item)
+    if not children:
+        return None
+    last = children[-1]
+    if last.tag != "anchor":
+        return None
+    name = (last.get("name") or "").strip()
+    return name or None
+
+
+def _extract_options_from_section(
+    section: ET.Element,
+    scope: str,
+    section_anchor: str,
+    sink: list[OptionEntry],
+) -> None:
+    for table in section.findall("table"):
+        # Walk the table's entries in order, carrying forward any
+        # ``@anchor{}`` makeinfo deposited at the tail of the previous entry's
+        # description (see :func:`_trailing_anchor`). The first entry uses the
+        # enclosing section anchor.
+        pending_anchor: str | None = None
+        for entry in table.findall("tableentry"):
+            entry_anchor = pending_anchor or section_anchor
+            option = _option_from_entry(entry, scope, entry_anchor)
+            if option is not None:
+                sink.append(option)
+            pending_anchor = _trailing_anchor(entry)
+    # Recurse into nested subsections (e.g. "Stream specifiers" can have them).
+    for sub_tag in ("section", "subsection", "subsubsection"):
+        for sub in section.findall(sub_tag):
+            sub_title = _section_title(sub)
+            sub_scope = _scope_for_section(sub_title, scope)
+            sub_anchor = _section_anchor(sub, sub_title) or section_anchor
+            _extract_options_from_section(sub, sub_scope, sub_anchor, sink)
+
+
+def _section_anchor(section: ET.Element, title: str) -> str:
+    """Resolve a section's HTML anchor.
+
+    An explicit ``@anchor{...}`` either inside the section (as a first child)
+    or *immediately* preceding it in the source survives in makeinfo's XML as
+    a sibling anchor or an in-section anchor — both are handled by the
+    caller, which scans for preceding-sibling anchors when walking direct
+    children. When no explicit anchor is provided, derive one from the title
+    using :func:`_makeinfo_anchor`.
+    """
+    inner = section.find("anchor")
+    if inner is not None and inner.get("name"):
+        return (inner.get("name") or "").strip()
+    return _makeinfo_anchor(title)
+
+
+def _option_from_entry(
+    entry: ET.Element, scope: str, anchor: str
+) -> OptionEntry | None:
+    items = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
+    if not items:
+        return None
+
+    names: list[str] = []
+    has_value = False
+    signatures: list[str] = []
+    for item in items:
+        fmt = item.find("itemformat")
+        head = fmt.text if (fmt is not None and fmt.text) else (item.text or "")
+        for name in _OPTION_NAME_RE.findall(head or ""):
+            names.append(_normalize_name(name))
+        # Presence of <var> or <emph> in itemformat signals the option takes
+        # a value (e.g. ``-i <var>url</var>``).
+        if fmt is not None and (fmt.find("var") is not None or "=" in (fmt.text or "")):
+            has_value = True
+        if fmt is not None:
+            # Render the documented signature with @var/@emph stripped — the
+            # raw text preserves the bracket grammar (``[-]input_file_id``,
+            # ``[:stream_specifier]``) which the description prose references
+            # by name. Collapse internal whitespace so makeinfo's line wraps
+            # don't survive into the JSON.
+            sig = " ".join(_plain_text(fmt).split())
+            if sig:
+                signatures.append(sig)
+
+    if not names:
+        return None
+
+    description_paragraphs: list[str] = []
+    for item in entry.findall("tableitem"):
+        description_paragraphs.extend(_render_paragraphs(item))
+
+    return OptionEntry(
+        name=names[0],
+        aliases=names[1:],
+        scope=scope,
+        value_type="string" if has_value else "none",
+        values=[],
+        requires=[],
+        conflicts=[],
+        description=description_paragraphs,
+        anchor=anchor,
+        signature=signatures,
+    )
+
+
+def parse_options_xml(root: ET.Element) -> list[OptionEntry]:
+    options: list[OptionEntry] = []
+
+    def visit(elem: ET.Element, scope: str, current_anchor: str) -> None:
+        # Track the most recent preceding-sibling <anchor name="..."> so that
+        # ``@anchor{Stream selection}\\n@chapter Stream selection`` gives the
+        # chapter the anchor's name. (Makeinfo emits the anchor as a sibling
+        # of the chapter, not a child.)
+        pending_anchor: str | None = None
+        for child in elem:
+            if child.tag == "anchor":
+                name = (child.get("name") or "").strip()
+                if name:
+                    pending_anchor = name
+                continue
+            if child.tag in _SECTION_TAGS:
+                title = _section_title(child)
+                child_scope = _scope_for_section(title, scope)
+                child_anchor = (
+                    pending_anchor or _section_anchor(child, title) or current_anchor
+                )
+                _extract_options_from_section(child, child_scope, child_anchor, options)
+                visit(child, child_scope, child_anchor)
+                pending_anchor = None
+            else:
+                visit(child, scope, current_anchor)
+                pending_anchor = None
+
+    visit(root, "global", "")
+    return options
+
+
+# === Codecs ========================================================
+
+# Headings that switch the current codec type when walking codecs.texi.
+def _codec_type_for_heading(title: str) -> str | None:
+    lower = title.lower()
+    if "video" in lower:
+        return "video"
+    if "audio" in lower:
+        return "audio"
+    if "subtitle" in lower:
+        return "subtitle"
+    return None
+
+
+def _codec_role_for_heading(title: str) -> tuple[bool, bool] | None:
+    """Return ``(encoder, decoder)`` if ``title`` declares a codec role."""
+    lower = title.lower()
+    enc = "encoder" in lower
+    dec = "decoder" in lower
+    if enc and not dec:
+        return (True, False)
+    if dec and not enc:
+        return (False, True)
+    return None
+
+
+_CODEC_TITLE_SPLIT = re.compile(r"\s*(?:,|\s+and\s+|\s*/\s*)\s*")
+
+
+def _codec_aliases_from_title(title: str) -> list[str]:
+    parts = [p.strip() for p in _CODEC_TITLE_SPLIT.split(title) if p.strip()]
+    out: list[str] = []
+    for part in parts:
+        # Drop trailing parens/qualifiers — e.g. "rawvideo (raw video)" → "rawvideo".
+        token = part.split("(", 1)[0].strip().split()[0] if part.split() else ""
+        normalized = _normalize_name(token)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def parse_codecs_xml(root: ET.Element) -> list[CodecEntry]:
+    codecs: list[CodecEntry] = []
+
+    def visit(elem: ET.Element, type_: str, role: tuple[bool, bool], in_codec_chapter: bool) -> None:
+        pending_anchor: str | None = None
+        for child in elem:
+            if child.tag == "anchor":
+                name = (child.get("name") or "").strip()
+                if name:
+                    pending_anchor = name
+                continue
+            if child.tag not in _SECTION_TAGS:
+                visit(child, type_, role, in_codec_chapter)
+                pending_anchor = None
+                continue
+
+            title = _section_title(child)
+            new_type = _codec_type_for_heading(title) or type_
+            new_role = _codec_role_for_heading(title) or role
+            section_anchor = pending_anchor or _section_anchor(child, title)
+            pending_anchor = None
+
+            is_codec_section = False
+            if child.tag == "chapter":
+                lower = title.lower()
+                # "Decoders", "Encoders", "Video Decoders", etc.
+                if "decoder" in lower or "encoder" in lower:
+                    in_codec_chapter = True
+                    role = new_role
+                    type_ = new_type
+                    visit(child, type_, role, True)
+                    continue
+                # Non-codec chapter (e.g. "Codec Options") — descend but don't
+                # treat its sections as codec entries.
+                visit(child, new_type, new_role, False)
+                continue
+
+            if in_codec_chapter and child.tag == "section":
+                # A `<section>` immediately under a codec chapter is a codec
+                # entry. Skip sections that look like grouped sub-headings.
+                lower = title.lower()
+                if "decoder" in lower or "encoder" in lower:
+                    # E.g. "QSV Decoders" — descend, treat children as codecs.
+                    visit(child, new_type, new_role, True)
+                    continue
+                aliases = _codec_aliases_from_title(title)
+                if aliases:
+                    codecs.append(
+                        CodecEntry(
+                            name=aliases[0],
+                            type=new_type,
+                            aliases=aliases[1:],
+                            encoder=new_role[0],
+                            decoder=new_role[1],
+                            anchor=section_anchor,
+                        )
+                    )
+                is_codec_section = True
+
+            # Descend regardless — sections can have meaningful sub-sections.
+            visit(child, new_type, new_role, in_codec_chapter and not is_codec_section)
+
+    visit(root, "video", (False, False), False)
+    return codecs
+
+
+# === Filters =======================================================
+
+def _filter_type_for_heading(title: str) -> str | None:
+    lower = title.lower()
+    if "filter" not in lower and "source" not in lower and "sink" not in lower:
+        return None
+    if "audio" in lower:
+        return "audio"
+    if "video" in lower:
+        return "video"
+    if "multimedia" in lower or "mix" in lower:
+        return "mixed"
+    return None
+
+
+def _filter_names_from_title(title: str) -> list[str]:
+    # Strip trailing parens — e.g. "abuffer (source)" → "abuffer".
+    base = title.split("(", 1)[0].strip()
+    if not base:
+        return []
+    parts = [p.strip() for p in base.split(",") if p.strip()]
+    names: list[str] = []
+    for part in parts:
+        # Sometimes the form is "aap algorithm" — keep only the leading token.
+        token = part.split()[0].strip("-")
+        normalized = _normalize_name(token)
+        if normalized:
+            names.append(normalized)
+    return names
+
+
+def _filter_args_from_section(section: ET.Element) -> tuple[list[str], dict[str, list[str]]]:
+    """Pull the @table @option args block (if any) at this section's level."""
+    params: list[str] = []
+    args: dict[str, list[str]] = {}
+    # Only the section's direct @table (not nested inside another filter).
+    for table in section.findall("table"):
+        for entry in table.findall("tableentry"):
+            for item in entry.findall("tableterm/item") + entry.findall("tableterm/itemx"):
+                fmt = item.find("itemformat")
+                raw = _plain_text(fmt) if fmt is not None else _plain_text(item)
+                arg_name = _arg_name_from_text(raw)
+                if not arg_name:
+                    continue
+                if arg_name not in args:
+                    args[arg_name] = []
+                    params.append(arg_name)
+                body: list[str] = []
+                for ti in entry.findall("tableitem"):
+                    body.extend(_render_paragraphs(ti))
+                if body:
+                    args[arg_name] = body
+    return params, args
+
+
+def _arg_name_from_text(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    # An item like "order @var{integer}" → first whitespace-separated token.
+    head = raw.split()[0]
+    head = head.split(",", 1)[0].strip()
+    return _normalize_name(head)
+
+
+def _filter_description(section: ET.Element) -> list[str]:
+    """Render all block content of ``section`` except the args @table."""
+    paragraphs: list[str] = []
+    # Skip the first @table @option (it's the args table, already extracted).
+    skipped_args_table = False
+    for child in section:
+        if child.tag == "table" and not skipped_args_table:
+            skipped_args_table = True
+            continue
+        if child.tag in _SECTION_TAGS:
+            # Sub-sections like "Examples"/"Commands" — flatten into desc.
+            sub = _render_paragraphs(child)
+            if sub:
+                title = _section_title(child).strip()
+                if title:
+                    paragraphs.append(f"**{title}**")
+                paragraphs.extend(sub)
+            continue
+        rendered = _render_block(child)
+        if rendered:
+            paragraphs.append(rendered)
+    return paragraphs
+
+
+def parse_filters_xml(root: ET.Element) -> list[FilterEntry]:
+    filters: list[FilterEntry] = []
+
+    def visit(elem: ET.Element, type_: str, in_filter_chapter: bool) -> None:
+        for child in elem:
+            if child.tag not in _SECTION_TAGS:
+                visit(child, type_, in_filter_chapter)
+                continue
+
+            title = _section_title(child)
+            new_type = _filter_type_for_heading(title) or type_
+
+            if child.tag == "chapter":
+                if _filter_type_for_heading(title) is not None:
+                    visit(child, new_type, True)
+                else:
+                    visit(child, new_type, False)
+                continue
+
+            if in_filter_chapter and child.tag == "section":
+                names = _filter_names_from_title(title)
+                if names:
+                    params, args = _filter_args_from_section(child)
+                    description = _filter_description(child)
+                    filters.append(
+                        FilterEntry(
+                            name=names[0],
+                            type=new_type,
+                            aliases=names[1:],
+                            params=params,
+                            description=description,
+                            args=args,
+                        )
+                    )
+                # Don't descend — sub-sections (Commands, Examples) are
+                # already merged into the filter's description.
+                continue
+
+            visit(child, new_type, in_filter_chapter)
+
+    visit(root, "video", False)
+    return filters
+
+
+# === Codec list from libavcodec C source ===========================
+
+def parse_codecs_c(text: str) -> dict[str, dict[str, bool]]:
+    entries: dict[str, dict[str, bool]] = {}
+    for match in re.finditer(r"ff_([a-z0-9_]+)_(encoder|decoder)", text):
+        name = _normalize_name(match.group(1))
+        kind = match.group(2)
+        if name not in entries:
+            entries[name] = {"encoder": False, "decoder": False}
+        entries[name][kind] = True
+    return entries
+
+
+def merge_codec_flags(
+    base: list[CodecEntry], flags: dict[str, dict[str, bool]]
+) -> list[CodecEntry]:
+    merged: list[CodecEntry] = []
+    for codec in base:
+        info = flags.get(codec.name)
+        if info:
+            merged.append(
+                replace(
+                    codec,
+                    encoder=codec.encoder or info.get("encoder", False),
+                    decoder=codec.decoder or info.get("decoder", False),
+                )
+            )
+        else:
+            merged.append(codec)
+    return merged
+
+
+# === Dedupe helpers (kept stable for the SPA) ======================
+
+def dedupe_options(options: list[OptionEntry]) -> list[OptionEntry]:
+    seen: dict[str, OptionEntry] = {}
+    for option in options:
+        if option.name not in seen:
+            seen[option.name] = option
+    return sorted(seen.values(), key=lambda o: o.name)
+
+
+def dedupe_codecs(codecs: list[CodecEntry]) -> list[CodecEntry]:
+    seen: dict[str, CodecEntry] = {}
+    for codec in codecs:
+        if codec.name not in seen:
+            seen[codec.name] = codec
+    return sorted(seen.values(), key=lambda c: c.name)
+
+
+def dedupe_filters(filters: list[FilterEntry]) -> list[FilterEntry]:
+    seen: dict[str, FilterEntry] = {}
+    for flt in filters:
+        if flt.name not in seen:
+            seen[flt.name] = flt
+    return sorted(seen.values(), key=lambda f: f.name)
+
+
+def dedupe_named(entries: list[NamedEntry]) -> list[NamedEntry]:
+    seen: dict[str, NamedEntry] = {}
+    for entry in entries:
+        if entry.name not in seen:
+            seen[entry.name] = entry
+    return sorted(seen.values(), key=lambda e: e.name)
+
+
+# === Named-section catalogs (demuxers, muxers, protocols, bitstream filters) ==
+
+# A "grouped" section is a `@section` whose heading is descriptive prose rather
+# than a single format/protocol name — e.g. ``Raw muxers`` or
+# ``MOV/MPEG-4/ISOMBFF muxers``. Its child `@table @samp` lists the actual
+# entities (mp4, mov, 3gp, …). The discriminator: presence of a space in the
+# heading. Single-entity headings like ``concat`` or ``flv, live_flv, kux`` or
+# ``mov/mp4/3gp`` never contain a space.
+def _is_grouped_section_title(title: str) -> bool:
+    return " " in title.strip()
+
+
+# Split a single-entity section heading into a primary name + aliases. The
+# heading conventions in the catalog texis are: comma-separated (``flv,
+# live_flv, kux``), slash-separated (``mov/mp4/3gp``), or just one token.
+_NAMED_TITLE_SPLIT = re.compile(r"\s*[,/]\s*")
+
+
+def _named_aliases_from_title(title: str) -> list[str]:
+    parts = [p.strip() for p in _NAMED_TITLE_SPLIT.split(title) if p.strip()]
+    out: list[str] = []
+    for part in parts:
+        token = part.split("(", 1)[0].strip()
+        normalized = _normalize_name(token)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def _makeinfo_anchor(title: str) -> str:
+    """Encode ``title`` the way ``makeinfo --html`` derives a section anchor.
+
+    Empirically (cross-checked against ``ffmpeg-all.html``): preserve ASCII
+    letters/digits and ``_``, map ASCII space to ``-``, encode every other
+    byte (including existing ``-``) as ``_XXXX`` (four hex digits of its
+    code point). The rule has to encode ``-`` because makeinfo uses ``-`` as
+    its escape for spaces; otherwise the mapping wouldn't round-trip.
+    Example: ``"MOV/MPEG-4/ISOMBFF muxers"`` ⇒
+    ``"MOV_002fMPEG_002d4_002fISOMBFF-muxers"``.
+    """
+    out: list[str] = []
+    for ch in title:
+        if ch == " ":
+            out.append("-")
+        elif ch == "_" or (ch.isascii() and ch.isalnum()):
+            out.append(ch)
+        else:
+            out.append(f"_{ord(ch):04x}")
+    return "".join(out)
+
+
+def _anchor_for_section(section_anchor: str | None, fallback_title: str) -> str:
+    """The HTML anchor that links to this entity.
+
+    Explicit ``@anchor{...}`` wins — its value already comes through the XML
+    in the encoded form makeinfo will use in the HTML output (e.g.
+    ``@anchor{raw muxers}`` ⇒ ``raw-muxers``). Otherwise we derive the
+    auto-anchor from the section title using the same encoding makeinfo
+    applies when it generates the HTML id.
+    """
+    if section_anchor:
+        return section_anchor
+    return _makeinfo_anchor(fallback_title)
+
+
+def _named_description(section: ET.Element) -> list[str]:
+    """Render a section's block content as Markdown paragraphs.
+
+    Subsections (Examples, Options, Syntax, Background, …) are flattened in,
+    matching the filter parser's treatment.
+    """
+    paragraphs: list[str] = []
+    for child in section:
+        if child.tag in _SECTION_TAGS:
+            sub = _render_paragraphs(child)
+            if sub:
+                title = _section_title(child).strip()
+                if title:
+                    paragraphs.append(f"**{title}**")
+                paragraphs.extend(sub)
+            continue
+        rendered = _render_block(child)
+        if rendered:
+            paragraphs.append(rendered)
+    return paragraphs
+
+
+def _named_entries_from_samp_table(
+    section: ET.Element, parent_anchor: str
+) -> list[NamedEntry]:
+    """Extract entities from each ``@table @samp`` ``@item`` inside ``section``.
+
+    Used for grouped sections (e.g. ``MOV/MPEG-4/ISOMBFF muxers``) where the
+    individual format names live as ``@samp`` items rather than as their own
+    sections. The anchor for each falls back to ``parent_anchor`` because
+    @samp items don't carry their own anchor; the section-level link is the
+    best target makeinfo emits.
+    """
+    out: list[NamedEntry] = []
+    for table in section.findall("table"):
+        if table.get("commandarg") not in ("samp", "option"):
+            continue
+        for entry in table.findall("tableentry"):
+            terms = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
+            if not terms:
+                continue
+            names: list[str] = []
+            aliases: list[str] = []
+            for item in terms:
+                fmt = item.find("itemformat")
+                raw = (
+                    _plain_text(fmt) if fmt is not None else _plain_text(item)
+                ).strip()
+                if not raw:
+                    continue
+                # Pull a single token from the item head; ignore any trailing
+                # @emph{audio}/@emph{video} marker and parenthetical aliases —
+                # but capture parenthetical aliases as additional names.
+                head = raw.split()[0].strip(",")
+                normalized = _normalize_name(head)
+                if normalized:
+                    names.append(normalized)
+                paren_match = re.search(r"\(([^)]+)\)", raw)
+                if paren_match:
+                    for piece in paren_match.group(1).split(","):
+                        alias = _normalize_name(piece.strip())
+                        if alias:
+                            aliases.append(alias)
+            if not names:
+                continue
+            description: list[str] = []
+            for body in entry.findall("tableitem"):
+                description.extend(_render_paragraphs(body))
+            primary = names[0]
+            all_aliases = list(dict.fromkeys(names[1:] + aliases))
+            all_aliases = [a for a in all_aliases if a != primary]
+            out.append(
+                NamedEntry(
+                    name=primary,
+                    aliases=all_aliases,
+                    anchor=parent_anchor,
+                    description=description,
+                )
+            )
+    return out
+
+
+def _collect_named_sections(
+    container: ET.Element, chapter_predicate, sink: list[NamedEntry]
+) -> None:
+    for chapter in container.iter("chapter"):
+        title = _section_title(chapter)
+        if not chapter_predicate(title):
+            continue
+        # Walk direct children so we can pair preceding `<anchor>` siblings
+        # with each `<section>` (the texis put `@anchor{x}` on the line above
+        # the section, which makeinfo emits as a sibling, not a child).
+        pending_anchor: str | None = None
+        for child in chapter:
+            if child.tag == "anchor":
+                pending_anchor = (child.get("name") or "").strip() or pending_anchor
+                continue
+            if child.tag != "section":
+                continue
+
+            section_title = _section_title(child).strip()
+            inner_anchor = child.find("anchor")
+            anchor_value = pending_anchor
+            if inner_anchor is not None and inner_anchor.get("name"):
+                anchor_value = (inner_anchor.get("name") or "").strip()
+            pending_anchor = None
+
+            if _is_grouped_section_title(section_title):
+                # The group section itself doesn't represent a single entity.
+                # Use its anchor (or section title) as the fallback link for
+                # each @samp item it contains.
+                fallback = _anchor_for_section(anchor_value, section_title)
+                sink.extend(_named_entries_from_samp_table(child, fallback))
+                continue
+
+            aliases = _named_aliases_from_title(section_title)
+            if not aliases:
+                continue
+            primary = aliases[0]
+            sink.append(
+                NamedEntry(
+                    name=primary,
+                    aliases=aliases[1:],
+                    anchor=_anchor_for_section(anchor_value, section_title),
+                    description=_named_description(child),
+                )
+            )
+
+
+def parse_demuxers_xml(root: ET.Element) -> list[NamedEntry]:
+    out: list[NamedEntry] = []
+    _collect_named_sections(root, lambda t: t.strip().lower() == "demuxers", out)
+    return out
+
+
+def parse_muxers_xml(root: ET.Element) -> list[NamedEntry]:
+    out: list[NamedEntry] = []
+    _collect_named_sections(root, lambda t: t.strip().lower() == "muxers", out)
+    return out
+
+
+def parse_protocols_xml(root: ET.Element) -> list[NamedEntry]:
+    out: list[NamedEntry] = []
+    # ``Protocols`` is the chapter that lists individual protocols. The
+    # ``Protocol Options`` chapter at the top is about global protocol
+    # options, not specific protocols — skip it.
+    _collect_named_sections(root, lambda t: t.strip().lower() == "protocols", out)
+    return out
+
+
+def parse_bitstream_filters_xml(root: ET.Element) -> list[NamedEntry]:
+    out: list[NamedEntry] = []
+    _collect_named_sections(
+        root, lambda t: t.strip().lower() == "bitstream filters", out
+    )
+    return out

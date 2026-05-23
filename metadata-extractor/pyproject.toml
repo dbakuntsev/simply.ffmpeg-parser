@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffmpeg-metadata-extract"
+version = "0.1.0"
+description = "Extract FFmpeg metadata for Simply.FFmpegParser"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [ { name = "Dmitry Bakuntsev" } ]
+
+[project.scripts]
+ffmpeg-metadata-extract = "ffmpeg_metadata_extractor.cli:main"
+
+[tool.setuptools.package-data]
+ffmpeg_metadata_extractor = ["assets/*"]
