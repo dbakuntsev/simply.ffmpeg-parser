@@ -1,0 +1,129 @@
+name: Deploy SPA to GitHub Pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+env:
+  FFMPEG_REPO: https://github.com/FFmpeg/FFmpeg.git
+  FFMPEG_SRC_DIR: ${{ github.workspace }}/.ffmpeg-src
+  EXTRACTOR_RANGE: n3.4.0..n9999.9999.9999
+
+jobs:
+  build:
+    name: Build SPA + metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system packages (git, texinfo)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git texinfo
+          git --version
+          makeinfo --version | head -n 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install ffmpeg-metadata-extract (editable)
+        run: python -m pip install --upgrade pip && pip install -e ./metadata-extractor
+
+      - name: Restore FFmpeg git clone cache
+        id: ffmpeg-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.FFMPEG_SRC_DIR }}
+          key: ffmpeg-git-${{ github.run_id }}
+          restore-keys: |
+            ffmpeg-git-
+
+      - name: Clone or update FFmpeg sources
+        run: |
+          set -euo pipefail
+          if [ -d "${FFMPEG_SRC_DIR}/.git" ]; then
+            echo "Updating existing FFmpeg clone…"
+            git -C "${FFMPEG_SRC_DIR}" remote set-url origin "${FFMPEG_REPO}"
+            git -C "${FFMPEG_SRC_DIR}" fetch --prune --tags --force origin
+          else
+            echo "Cloning FFmpeg from ${FFMPEG_REPO}…"
+            rm -rf "${FFMPEG_SRC_DIR}"
+            git clone --no-checkout "${FFMPEG_REPO}" "${FFMPEG_SRC_DIR}"
+          fi
+          echo "Tag count: $(git -C "${FFMPEG_SRC_DIR}" tag | wc -l)"
+
+      - name: Extract FFmpeg metadata + documentation
+        run: |
+          ffmpeg-metadata-extract \
+            --repo "${FFMPEG_SRC_DIR}" \
+            --out web/public \
+            --range "${EXTRACTOR_RANGE}" \
+            --latest-per-minor \
+            --verbose
+
+      - name: Regenerate metadata index.json from extraction output
+        shell: python
+        run: |
+          import json
+          import re
+          from pathlib import Path
+
+          base = Path("web/public/metadata/ffmpeg")
+          if not base.is_dir():
+              raise SystemExit(f"Metadata output directory not found: {base}")
+
+          version_pattern = re.compile(r"^\d+\.\d+$")
+          versions = sorted(
+              (p.name for p in base.iterdir() if p.is_dir() and version_pattern.match(p.name)),
+              key=lambda v: tuple(int(part) for part in v.split(".")),
+          )
+          if not versions:
+              raise SystemExit("No FFmpeg version directories were produced by the extractor")
+
+          (base / "index.json").write_text(json.dumps({"versions": versions}) + "\n", encoding="utf-8")
+          print(f"Wrote {base / 'index.json'} with {len(versions)} versions: {versions}")
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build SPA (Vite)
+        working-directory: web
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
