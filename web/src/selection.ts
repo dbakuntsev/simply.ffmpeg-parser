@@ -1,6 +1,9 @@
-import type { MetadataBundle, NamedEntry } from "./types";
+import type { MetadataBundle, NamedEntry, VersionCacheTokens } from "./types";
 import type { ParseResult } from "./parser";
 import { splitStreamSpecifier } from "./parser";
+import { withVersionQuery } from "./metadata";
+
+const DOC_ENTRY_FILENAME = "ffmpeg-all.html";
 
 export type SelectionDetailItem = { label: string; value: string };
 
@@ -86,12 +89,18 @@ function texinfoAnchor(s: string) {
   return s.replace(/[^A-Za-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
-function docsBase(version: string) {
-  return version ? `./doc/ffmpeg/${encodeURIComponent(version)}/ffmpeg-all.html` : "";
+function docsBase(version: string, docTokens?: Record<string, string>) {
+  if (!version) return "";
+  const url = `./doc/ffmpeg/${encodeURIComponent(version)}/${DOC_ENTRY_FILENAME}`;
+  return withVersionQuery(url, docTokens?.[DOC_ENTRY_FILENAME]);
 }
 
-function docsUrlForOption(version: string, optionInfo: OptionInfo | undefined) {
-  const base = docsBase(version);
+function docsUrlForOption(
+  version: string,
+  optionInfo: OptionInfo | undefined,
+  docTokens?: Record<string, string>
+) {
+  const base = docsBase(version, docTokens);
   if (!base) return undefined;
   // The extractor records each option's section anchor (or the explicit
   // ``@anchor{}`` immediately preceding the @item, when present). Use it
@@ -104,8 +113,12 @@ function docsUrlForOption(version: string, optionInfo: OptionInfo | undefined) {
   return base;
 }
 
-function docsUrlForFilter(version: string, name: string) {
-  const base = docsBase(version);
+function docsUrlForFilter(
+  version: string,
+  name: string,
+  docTokens?: Record<string, string>
+) {
+  const base = docsBase(version, docTokens);
   if (!base) return undefined;
   return `${base}#${texinfoAnchor(name.toLowerCase())}`;
 }
@@ -149,9 +162,10 @@ function describeNamedEntry(
   entry: NamedEntry,
   label: string,
   version: string,
-  value: string
+  value: string,
+  docTokens?: Record<string, string>
 ): ValueEnrichment {
-  const docsBaseUrl = docsBase(version);
+  const docsBaseUrl = docsBase(version, docTokens);
   const docLink: SelectionDocLink | undefined = docsBaseUrl
     ? {
         label: `${label}: ${value}`,
@@ -175,7 +189,8 @@ function enrichOptionValue(
   scope: "global" | "input" | "output",
   metadata: MetadataBundle,
   lookups: CatalogLookups,
-  version: string
+  version: string,
+  docTokens?: Record<string, string>
 ): ValueEnrichment | undefined {
   if (!values.length) return undefined;
   const value = values[0];
@@ -187,10 +202,10 @@ function enrichOptionValue(
   if (base === "-f") {
     if (scope === "input") {
       const entry = lookups.demuxers.get(lowerValue);
-      if (entry) return describeNamedEntry(entry, "Demuxer", version, value);
+      if (entry) return describeNamedEntry(entry, "Demuxer", version, value, docTokens);
     } else if (scope === "output") {
       const entry = lookups.muxers.get(lowerValue);
-      if (entry) return describeNamedEntry(entry, "Muxer", version, value);
+      if (entry) return describeNamedEntry(entry, "Muxer", version, value, docTokens);
     } else {
       const entry =
         lookups.demuxers.get(lowerValue) ?? lookups.muxers.get(lowerValue);
@@ -199,7 +214,8 @@ function enrichOptionValue(
           entry,
           lookups.demuxers.has(lowerValue) ? "Demuxer" : "Muxer",
           version,
-          value
+          value,
+          docTokens
         );
     }
   }
@@ -211,7 +227,7 @@ function enrichOptionValue(
     // them (not in this change).
     const first = value.split(",")[0].trim().split("=")[0];
     const entry = lookups.bsfs.get(first.toLowerCase());
-    if (entry) return describeNamedEntry(entry, "Bitstream filter", version, first);
+    if (entry) return describeNamedEntry(entry, "Bitstream filter", version, first, docTokens);
   }
 
   if (base === "-c" || base === "-codec" || base === "-vcodec" || base === "-acodec" || base === "-scodec") {
@@ -229,7 +245,7 @@ function enrichOptionValue(
       // including multi-name sections like "libx264, libx264rgb" ⇒
       // ``libx264_002c-libx264rgb``. Codecs that only exist in allcodecs.c
       // have an empty anchor; for those, link to the page itself.
-      const docsBaseUrl = docsBase(version);
+      const docsBaseUrl = docsBase(version, docTokens);
       const url = docsBaseUrl
         ? codec.anchor
           ? `${docsBaseUrl}#${codec.anchor}`
@@ -250,7 +266,8 @@ function enrichOptionValue(
 function enrichInputProtocol(
   source: string,
   lookups: CatalogLookups,
-  version: string
+  version: string,
+  docTokens?: Record<string, string>
 ): ValueEnrichment | undefined {
   const match = PROTOCOL_SCHEME_RE.exec(source);
   if (!match) return undefined;
@@ -259,7 +276,7 @@ function enrichInputProtocol(
   // that doesn't resolve probably isn't documented (e.g. a custom device).
   const entry = lookups.protocols.get(scheme);
   if (!entry) return undefined;
-  return describeNamedEntry(entry, "Protocol", version, scheme);
+  return describeNamedEntry(entry, "Protocol", version, scheme, docTokens);
 }
 
 type CatalogLookups = {
@@ -277,7 +294,8 @@ function buildOptionSelection(
   optionLookup: Map<string, OptionInfo>,
   metadata: MetadataBundle,
   lookups: CatalogLookups,
-  version: string
+  version: string,
+  docTokens?: Record<string, string>
 ): SelectionInfo {
   const { base, specifier } = splitStreamSpecifier(flag.toLowerCase());
   const optionInfo = optionLookup.get(base) ?? optionLookup.get(flag) ?? optionLookup.get(flag.toLowerCase());
@@ -313,7 +331,7 @@ function buildOptionSelection(
   if (optionInfo && optionInfo.description.length) description.push(...optionInfo.description);
   else if (explanation) description.push(...explanation.lines);
 
-  const enrichment = enrichOptionValue(flag, values, scope, metadata, lookups, version);
+  const enrichment = enrichOptionValue(flag, values, scope, metadata, lookups, version, docTokens);
   if (enrichment) description.push(...enrichment.paragraphs);
 
   const title = optionInfo?.name ?? explanation?.title ?? flag;
@@ -324,12 +342,18 @@ function buildOptionSelection(
     detail: [`${flag} ${valueStr}`.trim(), ...description].join("\n"),
     fields,
     description,
-    docsUrl: docsUrlForOption(version, optionInfo),
+    docsUrl: docsUrlForOption(version, optionInfo, docTokens),
     extraDocs,
   };
 }
 
-export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBundle, version: string) {
+export function buildSelectionInfo(
+  analysis: ParseResult,
+  metadata: MetadataBundle,
+  version: string,
+  versionTokens?: VersionCacheTokens
+) {
+  const docTokens = versionTokens?.doc;
   const info = new Map<string, SelectionInfo>();
   const optionLookup = new Map<string, OptionInfo>();
   metadata.options.options.forEach((opt) => {
@@ -356,7 +380,7 @@ export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBund
     ];
     const description: string[] = [];
     let extraDocs: SelectionDocLink[] | undefined;
-    const protocolEnrichment = enrichInputProtocol(input.source, lookups, version);
+    const protocolEnrichment = enrichInputProtocol(input.source, lookups, version, docTokens);
     if (protocolEnrichment) {
       description.push(...protocolEnrichment.paragraphs);
       if (protocolEnrichment.docLink) extraDocs = [protocolEnrichment.docLink];
@@ -381,7 +405,8 @@ export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBund
           optionLookup,
           metadata,
           lookups,
-          version
+          version,
+          docTokens
         )
       );
     });
@@ -409,7 +434,8 @@ export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBund
           optionLookup,
           metadata,
           lookups,
-          version
+          version,
+          docTokens
         )
       );
     });
@@ -472,7 +498,7 @@ export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBund
             detail: buildFilterStepExplanation(step.name, step.args, filterInfo),
             fields,
             description,
-            docsUrl: docsUrlForFilter(version, step.name),
+            docsUrl: docsUrlForFilter(version, step.name, docTokens),
           });
           step.args.forEach((arg, argIndex) => {
             const argDescription = buildFilterArgExplanation(arg.key, filterInfo);
@@ -484,7 +510,7 @@ export function buildSelectionInfo(analysis: ParseResult, metadata: MetadataBund
                 { label: "Value", value: arg.value },
               ],
               description: argDescription ? [argDescription] : [],
-              docsUrl: docsUrlForFilter(version, step.name),
+              docsUrl: docsUrlForFilter(version, step.name, docTokens),
             });
           });
         });

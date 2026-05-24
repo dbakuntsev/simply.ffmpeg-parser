@@ -1,20 +1,23 @@
-import { useEffect, useState } from "react";
-import { listAvailableVersions, loadMetadata } from "../metadata";
-import type { MetadataBundle } from "../types";
+import { useEffect, useMemo, useState } from "react";
+import { loadMetadata, loadVersionsCatalog } from "../metadata";
+import type { CacheTokens, MetadataBundle, VersionCacheTokens } from "../types";
 
 export function useMetadata() {
   const [versions, setVersions] = useState<string[]>([]);
   const [version, setVersion] = useState<string>("");
+  const [tokens, setTokens] = useState<CacheTokens>({});
   const [metadata, setMetadata] = useState<MetadataBundle | null>(null);
 
   useEffect(() => {
-    listAvailableVersions()
-      .then((list) => {
+    loadVersionsCatalog()
+      .then(({ versions: list, tokens: tokenMap }) => {
         setVersions(list);
+        setTokens(tokenMap);
         setVersion(list[0] ?? "");
       })
       .catch(() => {
         setVersions([]);
+        setTokens({});
         setVersion("");
       });
   }, []);
@@ -23,10 +26,15 @@ export function useMetadata() {
     if (!version) {
       return;
     }
-    loadMetadata(version)
+    loadMetadata(version, tokens[version])
       .then(setMetadata)
       .catch(() => setMetadata(null));
-  }, [version]);
+  }, [version, tokens]);
 
-  return { versions, version, setVersion, metadata };
+  const versionTokens: VersionCacheTokens | undefined = useMemo(
+    () => (version ? tokens[version] : undefined),
+    [version, tokens]
+  );
+
+  return { versions, version, setVersion, metadata, versionTokens };
 }

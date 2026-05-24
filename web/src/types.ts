@@ -154,6 +154,23 @@ export interface BitstreamFiltersMetadata {
   bitstream_filters: NamedEntry[];
 }
 
+/** Cache-buster tokens emitted by the deploy workflow. Keyed by file name
+ * within the version's metadata or doc directory; the value is a short hash
+ * appended as ``?v=<token>`` to defeat GitHub Pages' aggressive caching.
+ * Missing keys / absent tokens fall back to a bare URL — older deployments
+ * never carried these. */
+export interface VersionCacheTokens {
+  metadata?: Record<string, string>;
+  doc?: Record<string, string>;
+}
+
+export type CacheTokens = Record<string, VersionCacheTokens>;
+
+export interface VersionsIndex {
+  versions: string[];
+  tokens?: CacheTokens;
+}
+
 export interface MetadataBundle {
   index: MetadataIndex;
   options: OptionsMetadata;

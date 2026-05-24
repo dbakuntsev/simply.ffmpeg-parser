@@ -18,7 +18,7 @@ const ANALYZE_DEBOUNCE_MS = 500;
 export default function App() {
   const [command, setCommand] = useState(SAMPLE);
   const [submitted, setSubmitted] = useState(SAMPLE);
-  const { versions, version, setVersion, metadata } = useMetadata();
+  const { versions, version, setVersion, metadata, versionTokens } = useMetadata();
   const { selectedNode, select, clear } = useSelection();
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -44,8 +44,8 @@ export default function App() {
   const treeNodes = useMemo(() => (analysis ? buildTreeNodes(analysis.semantic) : []), [analysis]);
 
   const selectionInfo = useMemo(
-    () => (analysis && metadata ? buildSelectionInfo(analysis, metadata, version) : new Map()),
-    [analysis, metadata, version]
+    () => (analysis && metadata ? buildSelectionInfo(analysis, metadata, version, versionTokens) : new Map()),
+    [analysis, metadata, version, versionTokens]
   );
   const selection = selectedNode ? selectionInfo.get(selectedNode) ?? null : null;
 

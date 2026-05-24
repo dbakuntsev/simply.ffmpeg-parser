@@ -84,24 +84,61 @@ jobs:
       - name: Regenerate metadata index.json from extraction output
         shell: python
         run: |
+          import hashlib
           import json
           import re
           from pathlib import Path
 
-          base = Path("web/public/metadata/ffmpeg")
-          if not base.is_dir():
-              raise SystemExit(f"Metadata output directory not found: {base}")
+          metadata_base = Path("web/public/metadata/ffmpeg")
+          doc_base = Path("web/public/doc/ffmpeg")
+          if not metadata_base.is_dir():
+              raise SystemExit(f"Metadata output directory not found: {metadata_base}")
 
           version_pattern = re.compile(r"^\d+\.\d+$")
           versions = sorted(
-              (p.name for p in base.iterdir() if p.is_dir() and version_pattern.match(p.name)),
+              (p.name for p in metadata_base.iterdir() if p.is_dir() and version_pattern.match(p.name)),
               key=lambda v: tuple(int(part) for part in v.split(".")),
           )
           if not versions:
               raise SystemExit("No FFmpeg version directories were produced by the extractor")
 
-          (base / "index.json").write_text(json.dumps({"versions": versions}) + "\n", encoding="utf-8")
-          print(f"Wrote {base / 'index.json'} with {len(versions)} versions: {versions}")
+          def short_hash(path: Path) -> str:
+              # 12 hex chars of SHA-256 — collision-resistant enough for a cache
+              # buster and keeps URLs short.
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              return digest[:12]
+
+          tokens: dict[str, dict[str, dict[str, str]]] = {}
+          for version in versions:
+              entry: dict[str, dict[str, str]] = {}
+
+              metadata_dir = metadata_base / version
+              if metadata_dir.is_dir():
+                  metadata_files = {
+                      p.name: short_hash(p)
+                      for p in sorted(metadata_dir.iterdir())
+                      if p.is_file() and p.suffix == ".json"
+                  }
+                  if metadata_files:
+                      entry["metadata"] = metadata_files
+
+              doc_dir = doc_base / version
+              if doc_dir.is_dir():
+                  doc_files = {
+                      p.name: short_hash(p)
+                      for p in sorted(doc_dir.iterdir())
+                      if p.is_file() and p.suffix == ".html"
+                  }
+                  if doc_files:
+                      entry["doc"] = doc_files
+
+              if entry:
+                  tokens[version] = entry
+
+          payload = {"versions": versions, "tokens": tokens}
+          (metadata_base / "index.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+          print(f"Wrote {metadata_base / 'index.json'} with {len(versions)} versions: {versions}")
+          print(f"Cache-buster tokens emitted for {len(tokens)} versions")
 
       - name: Install web dependencies
         working-directory: web
