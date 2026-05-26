@@ -92,62 +92,89 @@ function nestOptions(options: OptionBinding[]): TreeNode[] {
   });
 }
 
+/** Single-shot placeholder used as a child of always-present top-level
+ * sections when they have nothing real to show. Non-interactive, italic,
+ * lighter gray — see ``TreeList`` for the rendering. */
+function placeholderChild(parentId: string): TreeNode {
+  return {
+    id: `${parentId}_empty`,
+    kind: "placeholder",
+    label: "(none)",
+  };
+}
+
+function withPlaceholder(parentId: string, children: TreeNode[]): TreeNode[] {
+  return children.length ? children : [placeholderChild(parentId)];
+}
+
 export function buildTreeNodes(semantic: SemanticCommand): TreeNode[] {
   return [
     {
       id: "globals",
       label: "Global Options",
       kind: "globals",
-      children: nestOptions(
-        semantic.globals.filter((opt) => !isFilterComplexBinding(opt))
+      children: withPlaceholder(
+        "globals",
+        nestOptions(
+          semantic.globals.filter((opt) => !isFilterComplexBinding(opt))
+        )
       ),
     },
     {
       id: "inputs",
       label: "Inputs",
       kind: "inputs",
-      children: semantic.inputs.map((input) => ({
-        id: input.id,
-        kind: "input",
-        label: input.source,
-        children: nestOptions(input.options),
-      })),
+      children: withPlaceholder(
+        "inputs",
+        semantic.inputs.map((input) => ({
+          id: input.id,
+          kind: "input",
+          label: input.source,
+          children: nestOptions(input.options),
+        }))
+      ),
     },
     {
       id: "filters",
       label: "Filters",
       kind: "filters",
-      children: semantic.filters.map((filter) => ({
-        id: filter.id,
-        kind: "filter",
-        label: filter.expression,
-        children: filter.chains?.map((chain) => ({
-          id: chain.id,
-          kind: "chain",
-          label: chain.label || "Filter Chain",
-          children: chain.filters.map((step, index) => ({
-            id: `${chain.id}_step_${index}`,
-            kind: "step",
-            label: step.name,
-            children: step.args.map((arg, argIndex) => ({
-              id: `${chain.id}_step_${index}_arg_${argIndex}`,
-              kind: "arg",
-              label: `${arg.key} = ${arg.value}`,
+      children: withPlaceholder(
+        "filters",
+        semantic.filters.map((filter) => ({
+          id: filter.id,
+          kind: "filter",
+          label: filter.expression,
+          children: filter.chains?.map((chain) => ({
+            id: chain.id,
+            kind: "chain",
+            label: chain.label || "Filter Chain",
+            children: chain.filters.map((step, index) => ({
+              id: `${chain.id}_step_${index}`,
+              kind: "step",
+              label: step.name,
+              children: step.args.map((arg, argIndex) => ({
+                id: `${chain.id}_step_${index}_arg_${argIndex}`,
+                kind: "arg",
+                label: `${arg.key} = ${arg.value}`,
+              })),
             })),
           })),
-        })),
-      })),
+        }))
+      ),
     },
     {
       id: "outputs",
       label: "Outputs",
       kind: "outputs",
-      children: semantic.outputs.map((output) => ({
-        id: output.id,
-        kind: "output",
-        label: output.target,
-        children: nestOptions(output.options),
-      })),
+      children: withPlaceholder(
+        "outputs",
+        semantic.outputs.map((output) => ({
+          id: output.id,
+          kind: "output",
+          label: output.target,
+          children: nestOptions(output.options),
+        }))
+      ),
     },
   ];
 }

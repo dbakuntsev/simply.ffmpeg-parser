@@ -1,6 +1,18 @@
 import { useState } from "react";
 
-export type TreeNodeKind = "globals" | "inputs" | "filters" | "outputs" | "input" | "filter" | "output" | "option" | "chain" | "step" | "arg";
+export type TreeNodeKind =
+  | "globals"
+  | "inputs"
+  | "filters"
+  | "outputs"
+  | "input"
+  | "filter"
+  | "output"
+  | "option"
+  | "chain"
+  | "step"
+  | "arg"
+  | "placeholder";
 
 export type TreeNode = {
   id: string;
@@ -93,9 +105,10 @@ function TreeItem({
   const kind = node.kind ?? "option";
   const icon = KIND_ICON[kind] ?? "·";
   const iconColor = KIND_COLOR[kind] ?? "text-muted";
+  const isPlaceholder = kind === "placeholder";
 
   return (
-    <li role="treeitem" aria-expanded={hasChildren ? !isCollapsed : undefined} aria-selected={isSelected}>
+    <li role="treeitem" aria-expanded={hasChildren ? !isCollapsed : undefined} aria-selected={isPlaceholder ? undefined : isSelected}>
       <div className="flex items-center">
         {hasChildren ? (
           <button
@@ -112,21 +125,35 @@ function TreeItem({
         ) : (
           <span aria-hidden="true" className="mr-1 inline-block h-5 w-5 shrink-0" />
         )}
-        <button
-          type="button"
-          aria-current={isSelected ? "true" : undefined}
-          className={`flex flex-1 items-center gap-2 rounded-[3px] px-2 py-1 text-left transition-colors focus:outline-none focus:ring-2 focus:ring-blue-200 ${
-            isSelected
-              ? "bg-blue-50 text-blue-800"
-              : "hover:bg-blue-50/60"
-          }`}
-          onClick={() => onSelect(node.id)}
-        >
-          <span aria-hidden="true" className={`inline-flex h-4 w-4 shrink-0 items-center justify-center text-[12px] ${iconColor}`}>
-            {icon}
+        {isPlaceholder ? (
+          // Non-interactive: rendered as a span, not a button, so it doesn't
+          // receive focus, doesn't get hover affordance, and can't be
+          // selected. Italic + lighter gray to read as an absence-of-data
+          // marker rather than a real tree entry. The text itself stays in
+          // the accessibility tree — "(none)" is informational for screen
+          // readers — only mouse-side interactivity is suppressed.
+          <span className="flex flex-1 items-center gap-2 px-2 py-1 text-left">
+            <span className="font-mono text-[13px] italic text-muted/60 break-all">
+              {node.label}
+            </span>
           </span>
-          <span className="font-mono text-[13px] break-all">{node.label}</span>
-        </button>
+        ) : (
+          <button
+            type="button"
+            aria-current={isSelected ? "true" : undefined}
+            className={`flex flex-1 items-center gap-2 rounded-[3px] px-2 py-1 text-left transition-colors focus:outline-none focus:ring-2 focus:ring-blue-200 ${
+              isSelected
+                ? "bg-blue-50 text-blue-800"
+                : "hover:bg-blue-50/60"
+            }`}
+            onClick={() => onSelect(node.id)}
+          >
+            <span aria-hidden="true" className={`inline-flex h-4 w-4 shrink-0 items-center justify-center text-[12px] ${iconColor}`}>
+              {icon}
+            </span>
+            <span className="font-mono text-[13px] break-all">{node.label}</span>
+          </button>
+        )}
       </div>
       {hasChildren && !isCollapsed && (
         <ul className="ml-2.5 mt-0.5 space-y-0.5 border-l border-edge pl-3.5" role="group">
