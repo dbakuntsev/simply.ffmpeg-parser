@@ -61,8 +61,9 @@ export function SelectionPanel({ selection, onClose }: Props) {
 
   const hasFields = !!(selection.fields && selection.fields.length > 0);
   const hasDescription = !!(selection.description && selection.description.length > 0);
+  const hasValues = !!(selection.values && selection.values.length > 0);
   const hasExtraDocs = !!(selection.extraDocs && selection.extraDocs.length > 0);
-  const useRichLayout = hasFields || hasDescription || selection.docsUrl || hasExtraDocs;
+  const useRichLayout = hasFields || hasDescription || hasValues || selection.docsUrl || hasExtraDocs;
   const descriptionHtml = useMemo(
     () => (hasDescription ? renderDescriptionHtml(selection.description!) : ""),
     [hasDescription, selection.description]
@@ -102,6 +103,21 @@ export function SelectionPanel({ selection, onClose }: Props) {
                 className="popover-md text-[13px] text-ink/90"
                 dangerouslySetInnerHTML={{ __html: descriptionHtml }}
               />
+            )}
+            {hasValues && (
+              <section>
+                <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-muted">
+                  Valid values
+                </h4>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[13px]">
+                  {selection.values!.map((row) => (
+                    <div key={row.name} className="contents">
+                      <dt className="font-mono text-ink">{row.name}</dt>
+                      <dd className="text-ink/80">{row.description || <span className="text-muted">—</span>}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
             )}
           </>
         ) : (

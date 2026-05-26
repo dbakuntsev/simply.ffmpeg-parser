@@ -10,6 +10,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from .avopt_c import (
+    AVCODEC_GLOBAL_KEY,
+    AVFORMAT_GLOBAL_KEY,
+    ParsedOption,
+    build_class_options_map,
+    enrich_options_with_c_values,
+)
 from .config_texi import generate_config_texi
 from .git_utils import list_tags, show_file, tag_date_iso, temporary_worktree
 from .models import AVOptionEntry, ExtractConfig
@@ -115,15 +122,20 @@ def select_tags(config: ExtractConfig, logger: Logger) -> list[str]:
     return result
 
 
-def _stage_doc_dir(repo: Path, tag: str, dest: Path) -> bool:
-    """Materialize ``doc/`` for ``tag`` into ``dest``. Returns True on success.
+def _stage_subtrees(repo: Path, tag: str, dest: Path, subtrees: tuple[str, ...]) -> bool:
+    """Materialize the given subtrees of ``tag`` into ``dest``. Returns
+    True iff every subtree extracts and the first one — historically
+    ``doc/`` — is present afterward.
 
-    Uses ``git archive`` to extract just the ``doc/`` subtree without
-    touching the working tree.
+    Uses ``git archive`` to avoid touching the working tree. The
+    available-subtree-set differs across older tags (e.g. libavformat
+    moved files around); a missing optional subtree is logged by the
+    caller, not failed here, so callers should only check existence of
+    the doc subtree (which is the hard requirement).
     """
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), "archive", tag, "doc"],
+            ["git", "-C", str(repo), "archive", tag, *subtrees],
             capture_output=True,
             check=True,
         )
@@ -141,7 +153,15 @@ def _stage_doc_dir(repo: Path, tag: str, dest: Path) -> bool:
         _ = tar
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-    return (dest / "doc").is_dir()
+    return (dest / subtrees[0]).is_dir()
+
+
+def _stage_doc_dir(repo: Path, tag: str, dest: Path) -> bool:
+    """Compat wrapper — stage ``doc/`` plus the libav source trees we
+    use for AVOption parsing. ``libavcodec``/``libavformat`` are
+    best-effort: their absence on a given tag will silently disable
+    C-source value enrichment, not the whole extraction."""
+    return _stage_subtrees(repo, tag, dest, ("doc", "libavcodec", "libavformat"))
 
 
 def _write_dummy_config_texi(repo: Path, tag: str, doc_dir: Path, version: str) -> None:
@@ -243,6 +263,7 @@ def _extract_codecs(
     fallback_root: Path | None,
     makeinfo_cmd: list[str],
     logger: Logger,
+    c_map: dict[str, list[ParsedOption]],
 ) -> list[dict]:
     root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger)
     codecs_from_doc = dedupe_codecs(parse_codecs_xml(root)) if root is not None else []
@@ -327,17 +348,31 @@ def _extract_codecs(
                 opts = per_codec.get(alias, [])
                 if opts:
                     break
-        c["options"] = [_av_option_to_dict(o) for o in opts]
+        # Overlay AV_OPT_TYPE_CONST value descriptions from the C source.
+        # The lookup tries the canonical codec name plus all aliases; the
+        # first AVClass-bound match wins.
+        enriched = enrich_options_with_c_values(
+            opts, c_map, [c["name"], *c.get("aliases", [])]
+        )
+        c["options"] = [_av_option_to_dict(o) for o in enriched]
 
     return codecs
 
 
 def _av_option_to_dict(o) -> dict:
+    # ``value_descriptions`` is normalized to len(values) before serialization
+    # so the SPA can pair them index-by-index without bounds checks.
+    descs = list(o.value_descriptions)
+    if len(descs) < len(o.values):
+        descs.extend([""] * (len(o.values) - len(descs)))
+    elif len(descs) > len(o.values):
+        descs = descs[: len(o.values)]
     return {
         "name": o.name,
         "aliases": o.aliases,
         "valueType": o.value_type,
         "values": o.values,
+        "valueDescriptions": descs,
         "description": o.description,
         "anchor": o.anchor,
         "signature": o.signature,
@@ -346,7 +381,10 @@ def _av_option_to_dict(o) -> dict:
 
 
 def _extract_codec_options(
-    doc_root: Path, makeinfo_cmd: list[str], logger: Logger
+    doc_root: Path,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+    c_map: dict[str, list[ParsedOption]],
 ) -> list[dict]:
     """Parse the generic AVCodec options chapter from ``codecs.texi``.
 
@@ -359,7 +397,9 @@ def _extract_codec_options(
         logger.debug("codecs.texi not found; codec_options will be empty")
         return []
     logger.debug("Parsing codec_options from codecs.texi")
-    return [_av_option_to_dict(o) for o in dedupe_av_options(parse_codec_options_xml(root))]
+    options = dedupe_av_options(parse_codec_options_xml(root))
+    options = enrich_options_with_c_values(options, c_map, [AVCODEC_GLOBAL_KEY])
+    return [_av_option_to_dict(o) for o in options]
 
 
 def _attach_per_format_options(
@@ -369,6 +409,7 @@ def _attach_per_format_options(
     side: str,
     makeinfo_cmd: list[str],
     logger: Logger,
+    c_map: dict[str, list[ParsedOption]],
 ) -> None:
     """Enrich a list of muxer/demuxer dicts in place with an ``options`` field
     sourced from ``muxers.texi`` / ``demuxers.texi``.
@@ -395,11 +436,17 @@ def _attach_per_format_options(
                 opts = by_name.get(alias, [])
                 if opts:
                     break
-        e["options"] = [_av_option_to_dict(o) for o in opts]
+        enriched = enrich_options_with_c_values(
+            opts, c_map, [e["name"], *e.get("aliases", [])]
+        )
+        e["options"] = [_av_option_to_dict(o) for o in enriched]
 
 
 def _extract_format_options(
-    doc_root: Path, makeinfo_cmd: list[str], logger: Logger
+    doc_root: Path,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+    c_map: dict[str, list[ParsedOption]],
 ) -> list[dict]:
     """Parse the generic AVFormat options chapter from ``formats.texi``."""
     root = _load_xml(doc_root, "formats.texi", makeinfo_cmd, logger)
@@ -407,7 +454,9 @@ def _extract_format_options(
         logger.debug("formats.texi not found; format_options will be empty")
         return []
     logger.debug("Parsing format_options from formats.texi")
-    return [_av_option_to_dict(o) for o in dedupe_av_options(parse_format_options_xml(root))]
+    options = dedupe_av_options(parse_format_options_xml(root))
+    options = enrich_options_with_c_values(options, c_map, [AVFORMAT_GLOBAL_KEY])
+    return [_av_option_to_dict(o) for o in options]
 
 
 def _extract_filters(doc_root: Path, makeinfo_cmd: list[str], logger: Logger) -> list[dict]:
@@ -531,15 +580,27 @@ def _extract_and_write(
     logger.info(f"Extracting {tag} -> {output_dir}")
 
     with _staged_doc(config.repo, tag, target_version, fallback_root) as doc_root:
+        # AVOption value descriptions come from the libav* C source, which
+        # is staged alongside ``doc/`` by ``_stage_doc_dir``. Missing trees
+        # (very old tag, archive failure) collapse to an empty map — the
+        # texi-derived options still surface, just without enum descriptions.
+        c_map = build_class_options_map(
+            (doc_root / "libavcodec", doc_root / "libavformat")
+        )
+        if c_map:
+            logger.debug(f"Parsed AVOption tables for {len(c_map)} classes")
+        else:
+            logger.debug("No AVOption tables parsed from libav* sources")
+
         if "options" in config.categories:
             options = _extract_options(doc_root, makeinfo_cmd, logger)
             _write_json(output_dir / "options.json", {"options": options})
 
         if "codecs" in config.categories:
             codecs = _extract_codecs(
-                doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger
+                doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger, c_map,
             )
-            codec_options = _extract_codec_options(doc_root, makeinfo_cmd, logger)
+            codec_options = _extract_codec_options(doc_root, makeinfo_cmd, logger, c_map)
             _write_json(
                 output_dir / "codecs.json",
                 {"codec_options": codec_options, "codecs": codecs},
@@ -556,7 +617,7 @@ def _extract_and_write(
             )
             _attach_per_format_options(
                 demuxers, doc_root, "demuxers.texi", "demuxer",
-                makeinfo_cmd, logger,
+                makeinfo_cmd, logger, c_map,
             )
             _write_json(output_dir / "demuxers.json", {"demuxers": demuxers})
 
@@ -567,9 +628,9 @@ def _extract_and_write(
             )
             _attach_per_format_options(
                 muxers, doc_root, "muxers.texi", "muxer",
-                makeinfo_cmd, logger,
+                makeinfo_cmd, logger, c_map,
             )
-            format_options = _extract_format_options(doc_root, makeinfo_cmd, logger)
+            format_options = _extract_format_options(doc_root, makeinfo_cmd, logger, c_map)
             _write_json(
                 output_dir / "muxers.json",
                 {"format_options": format_options, "muxers": muxers},

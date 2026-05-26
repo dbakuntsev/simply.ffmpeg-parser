@@ -1112,6 +1112,7 @@ def merge_per_codec_options(
                     anchor=prev.anchor,
                     signature=prev.signature,
                     roles=combined_roles,
+                    value_descriptions=prev.value_descriptions,
                 )
             else:
                 merged[name].append(option)

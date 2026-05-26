@@ -65,6 +65,11 @@ class AVOptionEntry:
     anchor: str = ""
     signature: list[str] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
+    # Same length as ``values``; index i is the short help text for
+    # ``values[i]``. "" when the source (texi or C) had no description for
+    # that value. Sourced from ``AV_OPT_TYPE_CONST`` help strings in
+    # libavcodec / libavformat C source (see :mod:`.avopt_c`).
+    value_descriptions: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

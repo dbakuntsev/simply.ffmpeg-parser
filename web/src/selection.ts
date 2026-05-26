@@ -9,6 +9,8 @@ export type SelectionDetailItem = { label: string; value: string };
 
 export type SelectionDocLink = { label: string; url: string };
 
+export type SelectionValueRow = { name: string; description: string };
+
 export type SelectionInfo = {
   title: string;
   /** Backward-compatible plain text body. */
@@ -17,6 +19,11 @@ export type SelectionInfo = {
   fields?: SelectionDetailItem[];
   /** Free-form description paragraphs. */
   description?: string[];
+  /** Documented named values (enum/flag tokens) plus the short help text
+   * sourced from libavcodec / libavformat ``AV_OPT_TYPE_CONST`` rows.
+   * Rendered as a definition-list table under the description. Omitted
+   * when the option carries no enumerated values. */
+  values?: SelectionValueRow[];
   /** Optional reference URL for the FFmpeg docs. */
   docsUrl?: string;
   /** Additional context-specific doc links (e.g. the demuxer section for
@@ -373,11 +380,24 @@ function buildOptionSelection(
   const title = optionInfo?.name ?? explanation?.title ?? flag;
   const extraDocs = enrichment?.docLink ? [enrichment.docLink] : undefined;
 
+  // Surface the option's documented values (e.g. ``-fflags`` flag names,
+  // ``-nal-hrd`` enum tokens) paired with their C-source help text where
+  // available. Empty for options whose value is a free-form string/number.
+  let valueRows: SelectionValueRow[] | undefined;
+  if (optionInfo?.values && optionInfo.values.length > 0) {
+    const descs = optionInfo.valueDescriptions ?? [];
+    valueRows = optionInfo.values.map((name, i) => ({
+      name,
+      description: descs[i] ?? "",
+    }));
+  }
+
   return {
     title,
     detail: [`${flag} ${valueStr}`.trim(), ...description].join("\n"),
     fields,
     description,
+    values: valueRows,
     docsUrl: docsUrlForOption(version, optionInfo, docTokens),
     extraDocs,
   };

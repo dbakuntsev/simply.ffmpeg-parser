@@ -189,6 +189,7 @@ function asOptionInfo(
     scope,
     valueType: av.valueType,
     values: av.values,
+    valueDescriptions: av.valueDescriptions,
     requires: [],
     conflicts: [],
     description: av.description,

@@ -111,6 +111,12 @@ export interface OptionsMetadata {
     scope: "global" | "input" | "output";
     valueType: string;
     values: string[];
+    /** Same length as ``values``; carries C-source help text for each
+     * named value when available. Driver options (from ``ffmpeg.texi``)
+     * never get this — only options bridged from the AVOption layer via
+     * the resolver populate it. Absent on bundles produced before the
+     * extractor learned to emit C-source value descriptions. */
+    valueDescriptions?: string[];
     requires: string[];
     conflicts: string[];
     description: string[];
@@ -140,6 +146,12 @@ export interface AVOptionEntry {
   aliases: string[];
   valueType: string;
   values: string[];
+  /** Same length as ``values``; index i is a short help string for
+   * ``values[i]``. Sourced from ``AV_OPT_TYPE_CONST`` help text in the
+   * libavcodec / libavformat C source. ``""`` when the source had no help
+   * for that value. Absent on bundles produced before the extractor
+   * learned to emit C-source value descriptions. */
+  valueDescriptions?: string[];
   description: string[];
   anchor?: string;
   signature?: string[];
