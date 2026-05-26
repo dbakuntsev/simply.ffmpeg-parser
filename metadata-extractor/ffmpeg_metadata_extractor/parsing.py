@@ -861,6 +861,46 @@ def _per_codec_option_from_entry(
     )
 
 
+def _av_option_richness(entry: AVOptionEntry) -> int:
+    """Score how "fully documented" an option entry is.
+
+    Some doc sections list the same flag multiple times — e.g. muxers.texi's
+    MOV ``Fragmentation`` subsection has shorthand items like
+    ``@item movflags +frag_keyframe`` that document one value of an option
+    later fully specified by ``@item movflags @var{flags}`` plus a value
+    table. Richness lets the section-level dedupe keep the proper entry
+    instead of the partial shorthand.
+
+    Higher = more informative. Ranked signals: explicit value table > a
+    scalar/flags/bool ``valueType`` (anything other than the default
+    ``"string"`` / ``"none"``) > longer description.
+    """
+    score = 0
+    if entry.values:
+        score += 1000
+    if entry.value_type not in ("string", "none"):
+        score += 100
+    score += len(entry.description)
+    return score
+
+
+def _dedupe_per_section(entries: list[AVOptionEntry]) -> list[AVOptionEntry]:
+    """Collapse same-name entries within a single section to the richest
+    documented variant; preserves first-seen order.
+    """
+    by_name: dict[str, AVOptionEntry] = {}
+    order: list[str] = []
+    for entry in entries:
+        existing = by_name.get(entry.name)
+        if existing is None:
+            by_name[entry.name] = entry
+            order.append(entry.name)
+            continue
+        if _av_option_richness(entry) > _av_option_richness(existing):
+            by_name[entry.name] = entry
+    return [by_name[n] for n in order]
+
+
 def _collect_per_codec_options(
     section: ET.Element, side: str
 ) -> list[AVOptionEntry]:
@@ -882,7 +922,7 @@ def _collect_per_codec_options(
             option = _per_codec_option_from_entry(entry, section_anchor, side)
             if option is not None:
                 out.append(option)
-    return out
+    return _dedupe_per_section(out)
 
 
 def parse_per_codec_options_xml(
@@ -937,6 +977,105 @@ def parse_per_codec_options_xml(
 
     visit(root, False)
     return by_codec
+
+
+def _section_family_members(
+    section: ET.Element, known: set[str]
+) -> list[str]:
+    """Family-section helper: read the leading ``@table @samp`` block (if any)
+    that enumerates constituent entities by name, and return those whose
+    first-token name matches the known set.
+
+    Used by muxer/demuxer per-section walking to handle "MOV/MPEG-4/ISOMBFF
+    muxers" → ``{3gp, 3g2, f4v, ipod, ismv, mov, mp4, psp}``. The samp table
+    must appear before the section's first subsection — otherwise it's
+    probably an enum value table embedded in an option description, not a
+    family roster.
+    """
+    members: list[str] = []
+    seen: set[str] = set()
+    for child in section:
+        if child.tag in _SECTION_TAGS:
+            break
+        if child.tag != "table" or child.get("commandarg") != "samp":
+            continue
+        for term in child.findall("tableentry/tableterm"):
+            for item in term.findall("item") + term.findall("itemx"):
+                fmt = item.find("itemformat")
+                raw = _plain_text(fmt) if fmt is not None else _plain_text(item)
+                head = raw.split("(", 1)[0].strip()
+                tokens = head.split()
+                if not tokens:
+                    continue
+                token = _normalize_name(tokens[0].rstrip(",:;."))
+                if token and token in known and token not in seen:
+                    seen.add(token)
+                    members.append(token)
+        # Only consult the first leading @samp table per section.
+        return members
+    return members
+
+
+def parse_per_format_options_xml(
+    root: ET.Element, side: str, known_format_names: set[str]
+) -> dict[str, list[AVOptionEntry]]:
+    """Walk ``muxers.texi`` / ``demuxers.texi`` and return, per muxer/demuxer,
+    the list of private options documented in its ``@section``.
+
+    Mirrors :func:`parse_per_codec_options_xml` but with two differences:
+
+    1. The chapter filter is ``"muxer"`` / ``"demuxer"``.
+    2. Many sections are *family* containers (``@section MOV/MPEG-4/ISOMBFF
+       muxers``) whose title doesn't match a single muxer name. When the
+       section opens with an ``@table @samp`` enumerating constituent muxers,
+       the options are attached to every enumerated member that exists in
+       the known set — recovering coverage for 3gp/3g2/f4v/ipod/ismv/mp4/psp
+       that the title alone would have missed.
+
+    ``side`` is the layer tag (``"muxer"`` or ``"demuxer"``) attached to each
+    emitted option's ``roles``.
+    """
+    by_name: dict[str, list[AVOptionEntry]] = {}
+
+    def visit(elem: ET.Element, in_chapter: bool) -> None:
+        for child in elem:
+            if child.tag not in _SECTION_TAGS:
+                continue
+            title = _section_title(child)
+
+            if child.tag == "chapter":
+                lower = title.lower()
+                if "muxer" in lower or "demuxer" in lower:
+                    visit(child, True)
+                else:
+                    visit(child, False)
+                continue
+
+            if not in_chapter or child.tag != "section":
+                continue
+
+            aliases = _codec_aliases_from_title(title)
+            matched: list[str] = []
+            seen: set[str] = set()
+            for a in aliases:
+                if a in known_format_names and a not in seen:
+                    seen.add(a)
+                    matched.append(a)
+            for m in _section_family_members(child, known_format_names):
+                if m not in seen:
+                    seen.add(m)
+                    matched.append(m)
+            if not matched:
+                continue
+
+            options = _collect_per_codec_options(child, side)
+            if not options:
+                continue
+            for name in matched:
+                by_name.setdefault(name, []).extend(options)
+
+    visit(root, False)
+    return by_name
 
 
 def merge_per_codec_options(

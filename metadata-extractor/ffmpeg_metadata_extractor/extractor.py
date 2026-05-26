@@ -31,6 +31,7 @@ from .parsing import (
     parse_muxers_xml,
     parse_options_xml,
     parse_per_codec_options_xml,
+    parse_per_format_options_xml,
     parse_protocols_xml,
 )
 from .texi_xml import MakeinfoError, resolve_makeinfo, run_makeinfo, run_makeinfo_html
@@ -361,6 +362,42 @@ def _extract_codec_options(
     return [_av_option_to_dict(o) for o in dedupe_av_options(parse_codec_options_xml(root))]
 
 
+def _attach_per_format_options(
+    entries: list[dict],
+    doc_root: Path,
+    source_file: str,
+    side: str,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+) -> None:
+    """Enrich a list of muxer/demuxer dicts in place with an ``options`` field
+    sourced from ``muxers.texi`` / ``demuxers.texi``.
+
+    Missing source: every entry's ``options`` becomes an empty list. The SPA
+    tolerates absence anyway, so older bundles aren't affected.
+    """
+    known: set[str] = set()
+    for e in entries:
+        known.add(e["name"])
+        for alias in e.get("aliases", []):
+            known.add(alias)
+
+    by_name: dict[str, list[AVOptionEntry]] = {}
+    root = _load_xml(doc_root, source_file, makeinfo_cmd, logger)
+    if root is not None:
+        logger.debug(f"Parsing per-{side} options from {source_file}")
+        by_name = parse_per_format_options_xml(root, side, known)
+
+    for e in entries:
+        opts: list[AVOptionEntry] = by_name.get(e["name"], [])
+        if not opts:
+            for alias in e.get("aliases", []):
+                opts = by_name.get(alias, [])
+                if opts:
+                    break
+        e["options"] = [_av_option_to_dict(o) for o in opts]
+
+
 def _extract_format_options(
     doc_root: Path, makeinfo_cmd: list[str], logger: Logger
 ) -> list[dict]:
@@ -517,11 +554,19 @@ def _extract_and_write(
                 doc_root, "demuxers.texi", parse_demuxers_xml, "demuxers",
                 makeinfo_cmd, logger,
             )
+            _attach_per_format_options(
+                demuxers, doc_root, "demuxers.texi", "demuxer",
+                makeinfo_cmd, logger,
+            )
             _write_json(output_dir / "demuxers.json", {"demuxers": demuxers})
 
         if "muxers" in config.categories:
             muxers = _extract_named(
                 doc_root, "muxers.texi", parse_muxers_xml, "muxers",
+                makeinfo_cmd, logger,
+            )
+            _attach_per_format_options(
+                muxers, doc_root, "muxers.texi", "muxer",
                 makeinfo_cmd, logger,
             )
             format_options = _extract_format_options(doc_root, makeinfo_cmd, logger)

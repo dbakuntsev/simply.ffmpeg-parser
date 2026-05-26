@@ -169,6 +169,14 @@ export interface NamedEntry {
   aliases: string[];
   anchor: string;
   description: string[];
+  /** Private options for this muxer / demuxer, harvested from
+   * ``muxers.texi`` / ``demuxers.texi``. Each entry's ``roles`` field
+   * contains ``"muxer"`` or ``"demuxer"`` so the SPA can pick the right
+   * set per pipeline side. Currently only populated for muxers and
+   * demuxers — protocols and bitstream filters reuse this type but always
+   * emit an empty list. Absent on bundles that predate the per-format
+   * extractor pass. */
+  options?: AVOptionEntry[];
 }
 
 export interface DemuxersMetadata {
