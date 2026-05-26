@@ -11,10 +11,10 @@ type Chip = {
 
 const TONE_CLASSES: Record<Chip["tone"], string> = {
   neutral: "bg-white text-ink border-edge",
-  input: "bg-blue-50 text-blue-800 border-blue-200",
-  filter: "bg-purple-50 text-purple-800 border-purple-200",
-  output: "bg-emerald-50 text-emerald-800 border-emerald-200",
-  codec: "bg-amber-50 text-amber-800 border-amber-200",
+  input: "bg-white text-ink border-edge",
+  filter: "bg-white text-ink border-edge",
+  output: "bg-white text-ink border-edge",
+  codec: "bg-[#f6f8fa] text-muted border-edge",
 };
 
 function collectCodecs(semantic: SemanticCommand): { video: string[]; audio: string[] } {
@@ -61,7 +61,7 @@ export function SummaryStrip({ semantic }: Props) {
       {chips.map((chip, index) => (
         <span
           key={`${chip.label}-${index}`}
-          className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${TONE_CLASSES[chip.tone]}`}
+          className={`inline-flex items-center rounded-[3px] border px-2 py-0.5 text-xs ${TONE_CLASSES[chip.tone]}`}
         >
           {chip.label}
         </span>

@@ -76,7 +76,7 @@ export const CommandInput = forwardRef<HTMLTextAreaElement, Props>(function Comm
         <label
           id={labelId}
           htmlFor={`${labelId}-textarea`}
-          className="text-xs font-semibold uppercase tracking-[0.2em] text-muted"
+          className="text-xs font-semibold uppercase tracking-wider text-muted"
         >
           Command
         </label>
@@ -85,7 +85,7 @@ export const CommandInput = forwardRef<HTMLTextAreaElement, Props>(function Comm
             type="button"
             aria-haspopup="menu"
             aria-expanded={examplesOpen}
-            className="inline-flex items-center gap-1 rounded-[3px] border border-edge bg-white/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.15em] text-muted hover:bg-white"
+            className="inline-flex items-center gap-1 rounded-[3px] border border-edge bg-white/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-muted hover:bg-white"
             onClick={() => setExamplesOpen((v) => !v)}
           >
             Examples

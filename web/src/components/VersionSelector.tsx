@@ -12,7 +12,7 @@ export function VersionSelector({ versions, version, onChange }: Props) {
     <div className="flex items-center gap-2">
       <label
         htmlFor={id}
-        className="text-xs font-semibold uppercase tracking-[0.2em] text-muted"
+        className="text-xs font-semibold uppercase tracking-wider text-muted"
       >
         FFmpeg Version
       </label>

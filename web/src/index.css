@@ -9,11 +9,8 @@
 
 @layer base {
   body {
-    @apply font-sans text-ink bg-[#f6f1ea];
-    background:
-      radial-gradient(circle at 15% 10%, #ffe8c2 0%, transparent 45%),
-      radial-gradient(circle at 85% 15%, #cde6ff 0%, transparent 50%),
-      linear-gradient(135deg, #f6f1ea 0%, #f7f5f2 100%);
+    @apply font-sans text-ink;
+    background: #f6f8fa;
   }
 }
 

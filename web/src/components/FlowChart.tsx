@@ -98,8 +98,8 @@ export function FlowChart({ nodes, links, selectedNode, onSelect }: Props) {
       .attr("x2", (d) => posOf(d.target).x)
       .attr("y1", (d) => posOf(d.source).y)
       .attr("y2", (d) => posOf(d.target).y)
-      .attr("stroke", "#b8b1a8")
-      .attr("stroke-width", 1.2);
+      .attr("stroke", "#d0d7de")
+      .attr("stroke-width", 1);
 
     const nodeGroup = svg
       .append("g")
@@ -139,7 +139,7 @@ export function FlowChart({ nodes, links, selectedNode, onSelect }: Props) {
       .append("circle")
       .attr("r", 18)
       .attr("fill", (d) => colorFor(d.group, d.id === selectedNode))
-      .attr("stroke", "#1e1a1f")
+      .attr("stroke", "#656d76")
       .attr("stroke-width", 1);
 
     nodeGroup
@@ -148,8 +148,8 @@ export function FlowChart({ nodes, links, selectedNode, onSelect }: Props) {
       .attr("y", -28)
       .attr("text-anchor", "middle")
       .attr("font-size", 12)
-      .attr("font-weight", 500)
-      .attr("fill", "#1e1a1f")
+      .attr("font-weight", 400)
+      .attr("fill", "#1f2328")
       .style("pointer-events", "none")
       .call(wrap, 140);
 
@@ -163,18 +163,18 @@ export function FlowChart({ nodes, links, selectedNode, onSelect }: Props) {
         .attr("text-anchor", "middle")
         .attr("font-size", 10)
         .attr("font-weight", 600)
-        .attr("letter-spacing", "0.2em")
-        .attr("fill", "#5e5760");
+        .attr("letter-spacing", "0.1em")
+        .attr("fill", "#656d76");
     });
   }, [nodes, links, selectedNode, onSelect, grouped, height, resizeTick]);
 
   return (
     <div className="rounded-[3px] border border-edge bg-white/70">
       <div className="flex items-center justify-end gap-3 px-3 pt-2 text-[11px] text-muted">
-        <Legend swatch="#5f9ed6" label="Input" />
-        <Legend swatch="#8d6cab" label="Filter" />
-        <Legend swatch="#2f855a" label="Output" />
-        <Legend swatch="#ffb347" label="Selected" />
+        <Legend swatch="#ffffff" label="Input" />
+        <Legend swatch="#d0d7de" label="Filter" />
+        <Legend swatch="#656d76" label="Output" />
+        <Legend swatch="#0969da" label="Selected" />
       </div>
       <svg
         ref={svgRef}
@@ -194,7 +194,7 @@ function Legend({ swatch, label }: { swatch: string; label: string }) {
       <span
         aria-hidden="true"
         className="inline-block h-2.5 w-2.5 rounded-full"
-        style={{ backgroundColor: swatch, border: "1px solid #1e1a1f" }}
+        style={{ backgroundColor: swatch, border: "1px solid #656d76" }}
       />
       {label}
     </span>
@@ -202,10 +202,10 @@ function Legend({ swatch, label }: { swatch: string; label: string }) {
 }
 
 function colorFor(group: string, selected: boolean) {
-  if (selected) return "#ffb347";
-  if (group === "input") return "#5f9ed6";
-  if (group === "filter") return "#8d6cab";
-  return "#2f855a";
+  if (selected) return "#0969da";
+  if (group === "input") return "#ffffff";
+  if (group === "filter") return "#d0d7de";
+  return "#656d76";
 }
 
 function wrap(textSelection: d3.Selection<SVGTextElement, any, any, any>, width: number) {

@@ -31,14 +31,14 @@ const KIND_ICON: Record<string, string> = {
 
 const KIND_COLOR: Record<string, string> = {
   globals: "text-muted",
-  inputs: "text-blue-700",
-  input: "text-blue-700",
-  filters: "text-purple-700",
-  filter: "text-purple-700",
-  chain: "text-purple-700",
-  step: "text-purple-700",
-  outputs: "text-emerald-700",
-  output: "text-emerald-700",
+  inputs: "text-muted",
+  input: "text-muted",
+  filters: "text-muted",
+  filter: "text-muted",
+  chain: "text-muted",
+  step: "text-muted",
+  outputs: "text-muted",
+  output: "text-muted",
   option: "text-muted",
   arg: "text-muted",
 };

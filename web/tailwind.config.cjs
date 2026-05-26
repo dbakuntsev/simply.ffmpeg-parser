@@ -4,17 +4,25 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ["Space Grotesk", "system-ui", "sans-serif"],
-        mono: ["IBM Plex Mono", "ui-monospace", "SFMono-Regular", "monospace"],
+        sans: [
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "Segoe UI",
+          "Roboto",
+          "Helvetica Neue",
+          "Arial",
+          "sans-serif",
+        ],
+        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
       },
       colors: {
-        ink: "#141014",
-        muted: "#5e5760",
+        ink: "#1f2328",
+        muted: "#656d76",
         panel: "#ffffff",
-        edge: "#e2d9cf",
+        edge: "#d0d7de",
       },
       boxShadow: {
-        panel: "0 18px 40px rgba(20, 16, 20, 0.12)",
+        panel: "none",
       },
     },
   },

@@ -69,7 +69,7 @@ export default function App() {
     <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8 overflow-x-hidden">
       <header className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
         <div className="flex flex-col gap-3">
-          <h1 className="text-3xl font-semibold tracking-tight text-ink">Simply FFmpeg Parser</h1>
+          <h1 className="text-xl font-semibold tracking-tight text-ink">Simply FFmpeg Parser</h1>
           <p className="max-w-2xl text-sm text-muted">
             Explore FFmpeg commands without running the binary. This SPA tokenizes, resolves scope, detects issues, and
             visualizes the flow.
@@ -84,7 +84,7 @@ export default function App() {
 
       <section className="rounded-[3px] border border-edge bg-panel p-5 shadow-panel">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Visualization</div>
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted">Visualization</div>
         </div>
         <div className="mt-3">
           <SummaryStrip semantic={analysis?.semantic ?? null} />

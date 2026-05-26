@@ -16,27 +16,27 @@ const SEVERITY_STYLES: Record<Issue["severity"], SeverityStyle> = {
   error: {
     label: "Error",
     icon: "✕",
-    badgeClass: "bg-red-100 text-red-700 border-red-300",
-    borderClass: "border-red-300",
+    badgeClass: "bg-red-50 text-red-700 border-red-200",
+    borderClass: "border-edge",
   },
   warning: {
     label: "Warning",
     icon: "!",
-    badgeClass: "bg-amber-100 text-amber-800 border-amber-300",
-    borderClass: "border-amber-300",
+    badgeClass: "bg-amber-50 text-amber-800 border-amber-200",
+    borderClass: "border-edge",
   },
   info: {
     label: "Info",
     icon: "i",
-    badgeClass: "bg-sky-100 text-sky-700 border-sky-300",
-    borderClass: "border-sky-300",
+    badgeClass: "bg-sky-50 text-sky-700 border-sky-200",
+    borderClass: "border-edge",
   },
 };
 
 export function DiagnosticsPanel({ issues, onIssueClick }: Props) {
   return (
     <section className="rounded-[3px] border border-edge bg-panel p-5 shadow-panel">
-      <div className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Diagnostics</div>
+      <div className="text-xs font-semibold uppercase tracking-wider text-muted">Diagnostics</div>
       <div className="mt-3 flex flex-col gap-2">
         {issues.length === 0 ? (
           <div className="flex items-center gap-2 rounded-[3px] border border-dashed border-edge bg-transparent px-3 py-2 text-sm text-muted">
