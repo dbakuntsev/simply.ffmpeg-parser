@@ -12,7 +12,7 @@ from xml.etree import ElementTree as ET
 
 from .config_texi import generate_config_texi
 from .git_utils import list_tags, show_file, tag_date_iso, temporary_worktree
-from .models import ExtractConfig
+from .models import AVOptionEntry, ExtractConfig
 from .parsing import (
     dedupe_av_options,
     dedupe_codecs,
@@ -20,6 +20,7 @@ from .parsing import (
     dedupe_named,
     dedupe_options,
     merge_codec_flags,
+    merge_per_codec_options,
     parse_bitstream_filters_xml,
     parse_codec_options_xml,
     parse_codecs_c,
@@ -29,6 +30,7 @@ from .parsing import (
     parse_format_options_xml,
     parse_muxers_xml,
     parse_options_xml,
+    parse_per_codec_options_xml,
     parse_protocols_xml,
 )
 from .texi_xml import MakeinfoError, resolve_makeinfo, run_makeinfo, run_makeinfo_html
@@ -289,7 +291,44 @@ def _extract_codecs(
         }
         for c in merged
     ]
-    return sorted(documented + extras, key=lambda c: c["name"])
+    codecs = sorted(documented + extras, key=lambda c: c["name"])
+
+    # Attach per-codec private options harvested from encoders.texi /
+    # decoders.texi. Both sources are optional; older tags' docs may be
+    # missing one or both, in which case the per-codec options[] just
+    # stays empty on every entry.
+    known_names: set[str] = set()
+    for c in codecs:
+        known_names.add(c["name"])
+        for alias in c.get("aliases", []):
+            known_names.add(alias)
+
+    encoder_options: dict[str, list[AVOptionEntry]] = {}
+    decoder_options: dict[str, list[AVOptionEntry]] = {}
+    enc_root = _load_xml(doc_root, "encoders.texi", makeinfo_cmd, logger)
+    if enc_root is not None:
+        logger.debug("Parsing per-codec encoder options from encoders.texi")
+        encoder_options = parse_per_codec_options_xml(enc_root, "encoder", known_names)
+    dec_root = _load_xml(doc_root, "decoders.texi", makeinfo_cmd, logger)
+    if dec_root is not None:
+        logger.debug("Parsing per-codec decoder options from decoders.texi")
+        decoder_options = parse_per_codec_options_xml(dec_root, "decoder", known_names)
+
+    per_codec = merge_per_codec_options(encoder_options, decoder_options)
+    for c in codecs:
+        # Aliases share an options table — when ``parse_codecs_xml`` collapsed
+        # ``libx264, libx264rgb`` into a single entry, the per-codec parser
+        # may have keyed its options under either name. Try the canonical
+        # first, then any aliases, and emit the first hit.
+        opts: list[AVOptionEntry] = per_codec.get(c["name"], [])
+        if not opts:
+            for alias in c.get("aliases", []):
+                opts = per_codec.get(alias, [])
+                if opts:
+                    break
+        c["options"] = [_av_option_to_dict(o) for o in opts]
+
+    return codecs
 
 
 def _av_option_to_dict(o) -> dict:

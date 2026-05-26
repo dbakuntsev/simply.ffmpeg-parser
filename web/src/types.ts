@@ -144,6 +144,12 @@ export interface CodecsMetadata {
     /** HTML anchor for the codec's section in ``ffmpeg-all.html``. May be
      * empty for entries that only exist in ``allcodecs.c``. */
     anchor?: string;
+    /** Private options for this codec, harvested from ``encoders.texi`` /
+     * ``decoders.texi``. Each entry's ``roles`` field contains ``"encoder"``
+     * and/or ``"decoder"`` so the SPA can pick the right set based on which
+     * side of the pipeline ``-c[:type]`` selected it. Absent on bundles that
+     * predate the per-codec extractor pass. */
+    options?: AVOptionEntry[];
   }>;
 }
 

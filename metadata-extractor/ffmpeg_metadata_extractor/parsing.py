@@ -776,6 +776,209 @@ def parse_format_options_xml(root: ET.Element) -> list[AVOptionEntry]:
     return _parse_av_options(root, _AV_FORMAT_ROLES)
 
 
+# === Per-codec private options =====================================
+#
+# encoders.texi / decoders.texi document codec-private AVOptions ("the libx264
+# preset", "the aom-av1 cq-level") that don't live in either codecs.texi's
+# generic chapter or in ffmpeg.texi's driver-options pool. Each ``@section``
+# in those files is a codec (or codec family); options are listed in one or
+# more ``@table @option`` blocks reachable from the section (an ``Options``
+# subsection in the common case, but several encoders use other titles —
+# "Private Options for X", "Metadata Control Options" — so we collect every
+# descendant option table indiscriminately).
+
+
+def _per_codec_option_from_entry(
+    entry: ET.Element, anchor: str, side: str
+) -> AVOptionEntry | None:
+    """Build one :class:`AVOptionEntry` for a per-codec option ``<tableentry>``.
+
+    Differs from :func:`_av_option_from_entry` in three ways:
+
+    1. ``@item`` heads sometimes carry a leading ``-`` (ac3's
+       ``@item -per_frame_metadata @var{boolean}``); strip it before name
+       matching so the canonical form (``-per_frame_metadata``) survives.
+    2. The ``(@emph{x264-equivalent})`` parenthetical is *not* a role tag — it
+       names the upstream library's equivalent option for migration help.
+       Roles for per-codec options are unambiguous: ``["encoder"]`` for
+       encoders.texi entries, ``["decoder"]`` for decoders.texi entries.
+    3. Most documented options take string values even without an explicit
+       ``@var{type}`` (encoders.texi rarely uses type hints — libx264's
+       ``@item preset (@emph{preset})`` is the rule, not the exception).
+       Default to ``"string"`` here; tighten only when a ``@var`` is present
+       *and* hints at a stronger scalar type.
+    """
+    items = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
+    if not items:
+        return None
+
+    names: list[str] = []
+    value_type = "string"  # encoders.texi default — most items take values.
+    signatures: list[str] = []
+
+    for item in items:
+        fmt = item.find("itemformat")
+        if fmt is None:
+            continue
+        head = _plain_text(fmt)
+        head_for_name = head.split("(", 1)[0].strip()
+        # ac3 / a few others write ``@item -per_frame_metadata @var{boolean}``;
+        # strip the leading dash before matching so the regex (which expects
+        # an alpha lead char) succeeds either way.
+        name_text = head_for_name.lstrip("-")
+        match = _AV_OPTION_NAME_RE.match(name_text)
+        if match:
+            names.append(f"-{_normalize_name(match.group(1))}")
+
+        classified = _classify_value_type(fmt)
+        if classified is not None and classified != "string":
+            value_type = classified
+
+        sig = " ".join(head.split())
+        if sig:
+            signatures.append(sig)
+
+    if not names:
+        return None
+
+    description_paragraphs: list[str] = []
+    for item in entry.findall("tableitem"):
+        description_paragraphs.extend(_render_paragraphs(item))
+
+    values = _extract_enum_values(entry)
+    if values and value_type not in ("flags",):
+        value_type = "enum"
+
+    return AVOptionEntry(
+        name=names[0],
+        aliases=names[1:],
+        value_type=value_type,
+        values=values,
+        description=description_paragraphs,
+        anchor=anchor,
+        signature=signatures,
+        roles=[side],
+    )
+
+
+def _collect_per_codec_options(
+    section: ET.Element, side: str
+) -> list[AVOptionEntry]:
+    """Walk every ``@table @option`` block reachable from ``section`` and
+    emit a private-option entry for each ``<tableentry>``.
+
+    Doesn't gate on the subsection title — encoders.texi uses "Options",
+    "Private Options for X", "Metadata Control Options", and "Shared
+    options" / "Private options" splits depending on the codec. The
+    section's own ``@anchor{}`` (or makeinfo-derived anchor) is used for
+    every option; per-option anchors aren't worth tracking at this layer.
+    """
+    section_anchor = _section_anchor(section, _section_title(section))
+    out: list[AVOptionEntry] = []
+    for table in section.iter("table"):
+        if table.get("commandarg") != "option":
+            continue
+        for entry in table.findall("tableentry"):
+            option = _per_codec_option_from_entry(entry, section_anchor, side)
+            if option is not None:
+                out.append(option)
+    return out
+
+
+def parse_per_codec_options_xml(
+    root: ET.Element, side: str, known_codec_names: set[str]
+) -> dict[str, list[AVOptionEntry]]:
+    """Walk ``encoders.texi`` / ``decoders.texi`` and return, per codec,
+    the list of private options documented in its ``@section``.
+
+    ``side`` is the layer tag attached to every emitted option's ``roles``:
+    ``"encoder"`` or ``"decoder"``.
+
+    ``known_codec_names`` filters section titles down to those whose
+    aliases actually match a codec already discovered in ``codecs.texi`` +
+    ``allcodecs.c``. Family / umbrella sections that don't match (e.g.
+    "QSV Encoders", "VAAPI encoders") are dropped — their constituent
+    codecs (``h264_qsv``, ``hevc_qsv``, …) get no private options for v1.
+    """
+    by_codec: dict[str, list[AVOptionEntry]] = {}
+
+    def visit(elem: ET.Element, in_codec_chapter: bool) -> None:
+        for child in elem:
+            if child.tag not in _SECTION_TAGS:
+                continue
+            title = _section_title(child)
+
+            if child.tag == "chapter":
+                lower = title.lower()
+                # "Encoders", "Audio Encoders", "Video Encoders", … and the
+                # same with "Decoders". An umbrella "@chapter Encoders" with
+                # no qualifier counts too.
+                if "encoder" in lower or "decoder" in lower:
+                    visit(child, True)
+                else:
+                    visit(child, False)
+                continue
+
+            if not in_codec_chapter or child.tag != "section":
+                # Subsections of an unmatched parent contribute nothing on
+                # their own — only ``@section`` granularity is treated as a
+                # codec boundary.
+                continue
+
+            aliases = _codec_aliases_from_title(title)
+            matched = [a for a in aliases if a in known_codec_names]
+            if not matched:
+                continue
+            options = _collect_per_codec_options(child, side)
+            if not options:
+                continue
+            for name in matched:
+                by_codec.setdefault(name, []).extend(options)
+
+    visit(root, False)
+    return by_codec
+
+
+def merge_per_codec_options(
+    encoder_side: dict[str, list[AVOptionEntry]],
+    decoder_side: dict[str, list[AVOptionEntry]],
+) -> dict[str, list[AVOptionEntry]]:
+    """Combine encoder-side and decoder-side option tables for the same
+    codec. Options with the same name across both sides have their
+    ``roles`` lists unioned (the encoder-side entry's other fields win —
+    encoders.texi tends to be the more thoroughly documented half).
+    """
+    merged: dict[str, list[AVOptionEntry]] = {}
+    for name, options in encoder_side.items():
+        merged[name] = list(options)
+    for name, options in decoder_side.items():
+        if name not in merged:
+            merged[name] = list(options)
+            continue
+        existing_by_name = {o.name: i for i, o in enumerate(merged[name])}
+        for option in options:
+            if option.name in existing_by_name:
+                idx = existing_by_name[option.name]
+                prev = merged[name][idx]
+                combined_roles = list(prev.roles)
+                for r in option.roles:
+                    if r not in combined_roles:
+                        combined_roles.append(r)
+                merged[name][idx] = AVOptionEntry(
+                    name=prev.name,
+                    aliases=prev.aliases,
+                    value_type=prev.value_type,
+                    values=prev.values,
+                    description=prev.description,
+                    anchor=prev.anchor,
+                    signature=prev.signature,
+                    roles=combined_roles,
+                )
+            else:
+                merged[name].append(option)
+    return merged
+
+
 # === Codecs ========================================================
 
 # Headings that switch the current codec type when walking codecs.texi.
