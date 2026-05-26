@@ -1,10 +1,14 @@
 import type { MetadataBundle, OptionBinding, SemanticCommand, Token } from "../types";
-import { buildOptionLookup, resolveOptionInfo, shouldExpectValue } from "./fallbacks";
 import { parseFilterComplex } from "./filters";
 import { nextBindingId } from "./ids";
+import { ResolvedOption, shouldExpectValue } from "./resolver";
 import { splitStreamSpecifier } from "./streamSpecifier";
 
-export function buildSemantic(tokens: Token[], metadata: MetadataBundle): SemanticCommand {
+export function buildSemantic(
+  tokens: Token[],
+  _metadata: MetadataBundle,
+  resolved: Map<string, ResolvedOption | null>
+): SemanticCommand {
   const globals: OptionBinding[] = [];
   const inputs: OptionBinding[] = [];
   const outputs: OptionBinding[] = [];
@@ -15,8 +19,6 @@ export function buildSemantic(tokens: Token[], metadata: MetadataBundle): Semant
     expression: string;
     chains?: { id: string; label: string; filters: { name: string; args: { key: string; value: string }[] }[] }[];
   }[] = [];
-
-  const optionLookup = buildOptionLookup(metadata);
 
   let inputIndex = -1;
   let outputIndex = -1;
@@ -75,8 +77,9 @@ export function buildSemantic(tokens: Token[], metadata: MetadataBundle): Semant
     }
 
     if (token.type === "flag") {
-      const optionInfo = resolveOptionInfo(token, optionLookup);
-      const expectsValue = shouldExpectValue(optionInfo, token.normalizedText);
+      const resolution = resolved.get(token.id) ?? null;
+      const optionInfo = resolution?.info ?? null;
+      const expectsValue = shouldExpectValue(optionInfo);
       const binding: OptionBinding = {
         id: nextBindingId(),
         flag: token.text,
@@ -85,6 +88,10 @@ export function buildSemantic(tokens: Token[], metadata: MetadataBundle): Semant
         inputIndex: null,
         outputIndex: null,
         tokenIds: [token.id],
+        resolutionSource: resolution?.source ?? "unknown",
+        matchedCodec: resolution?.matchedCodec,
+        matchedFormat: resolution?.matchedFormat,
+        inferredStreamType: resolution?.inferredStreamType,
       };
 
       if (expectsValue && tokens[i + 1] && tokens[i + 1].type !== "flag") {
@@ -105,9 +112,20 @@ export function buildSemantic(tokens: Token[], metadata: MetadataBundle): Semant
         i += 1;
       }
 
-      const { specifier } = splitStreamSpecifier(token.normalizedText);
+      const { base, specifier } = splitStreamSpecifier(token.normalizedText);
       const hasSpecifier = !!specifier;
-      const scope = optionInfo?.scope ?? "global";
+      let scope = optionInfo?.scope ?? "global";
+
+      // ``-f X`` is documented as global in ffmpeg.texi but behaves
+      // positionally — it sets the format of the *next* file (demuxer before
+      // ``-i``, muxer after). Route it into the input/output bucket so
+      // format-private options like ``-movflags`` can nest under it in the
+      // tree visualizer. The resolver already tracks the same positional
+      // distinction via ``matchedFormat``, so this just aligns scope
+      // attachment with how the option actually applies.
+      if (base === "-f") {
+        scope = inputIndex >= 0 ? "output" : "input";
+      }
 
       if (scope === "input") {
         if (hasSpecifier && inputIndex >= 0) {

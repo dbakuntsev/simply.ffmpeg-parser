@@ -1,11 +1,15 @@
 import type { Issue, MetadataBundle, SemanticCommand, Token } from "../types";
-import { buildOptionLookup, resolveOptionInfo, shouldExpectValue } from "./fallbacks";
 import { nextIssueId } from "./ids";
+import { ResolvedOption, shouldExpectValue } from "./resolver";
 import { splitStreamSpecifier } from "./streamSpecifier";
 
-export function detectIssues(tokens: Token[], semantic: SemanticCommand, metadata: MetadataBundle): Issue[] {
+export function detectIssues(
+  tokens: Token[],
+  semantic: SemanticCommand,
+  _metadata: MetadataBundle,
+  resolved: Map<string, ResolvedOption | null>
+): Issue[] {
   const issues: Issue[] = [];
-  const optionLookup = buildOptionLookup(metadata);
 
   let hasGenericCodecFlag = false;
   const copyCodecTokenIds: string[] = [];
@@ -16,7 +20,8 @@ export function detectIssues(tokens: Token[], semantic: SemanticCommand, metadat
       continue;
     }
 
-    const optionInfo = resolveOptionInfo(token, optionLookup);
+    const resolution = resolved.get(token.id) ?? null;
+    const optionInfo = resolution?.info ?? null;
     if (!optionInfo) {
       issues.push({
         id: nextIssueId(),
@@ -37,7 +42,7 @@ export function detectIssues(tokens: Token[], semantic: SemanticCommand, metadat
     }
 
     const valueToken = tokens[i + 1];
-    const expectsValue = shouldExpectValue(optionInfo, token.normalizedText);
+    const expectsValue = shouldExpectValue(optionInfo);
     if (expectsValue) {
       const valueMissing = !valueToken || (valueToken.type === "flag" && !allowsFlagValue(optionInfo, valueToken.text));
       if (valueMissing) {

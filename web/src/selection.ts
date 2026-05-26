@@ -1,5 +1,5 @@
-import type { MetadataBundle, NamedEntry, VersionCacheTokens } from "./types";
-import type { ParseResult } from "./parser";
+import type { MetadataBundle, NamedEntry, OptionBinding, VersionCacheTokens } from "./types";
+import type { ParseResult, ResolvedOption } from "./parser";
 import { splitStreamSpecifier } from "./parser";
 import { withVersionQuery } from "./metadata";
 
@@ -130,7 +130,7 @@ function formatScope(scope: string) {
   return scope;
 }
 
-function describeStreamSpecifier(specifier: string | null) {
+function describeStreamSpecifier(specifier: string | null | undefined) {
   if (!specifier) return null;
   if (specifier.startsWith("v")) return "Applies to video streams.";
   if (specifier.startsWith("a")) return "Applies to audio streams.";
@@ -286,19 +286,51 @@ type CatalogLookups = {
   bsfs: Map<string, NamedEntry>;
 };
 
+/** Human-readable label for the layer the resolver picked the option from.
+ * Appears in the "Source" field of the selection popover so the user knows
+ * whether they're looking at a driver option, a codec-private flag, etc. */
+function formatResolutionSource(binding: OptionBinding): string | null {
+  switch (binding.resolutionSource) {
+    case "driver":
+      return "Driver option (ffmpeg.texi)";
+    case "codec-private":
+      return binding.matchedCodec
+        ? `Codec-private (${binding.matchedCodec})`
+        : "Codec-private option";
+    case "codec-generic":
+      return "Generic AVCodec option";
+    case "format-private":
+      return binding.matchedFormat
+        ? `Format-private (${binding.matchedFormat})`
+        : "Format-private option";
+    case "format-generic":
+      return "Generic AVFormat option";
+    case "unknown":
+      return null;
+    default:
+      return null;
+  }
+}
+
 function buildOptionSelection(
   scopeLabel: string,
   scope: "global" | "input" | "output",
-  flag: string,
-  values: string[],
-  optionLookup: Map<string, OptionInfo>,
+  binding: OptionBinding,
+  resolved: Map<string, ResolvedOption | null>,
   metadata: MetadataBundle,
   lookups: CatalogLookups,
   version: string,
   docTokens?: Record<string, string>
 ): SelectionInfo {
+  const flag = binding.flag;
+  const values = binding.values;
   const { base, specifier } = splitStreamSpecifier(flag.toLowerCase());
-  const optionInfo = optionLookup.get(base) ?? optionLookup.get(flag) ?? optionLookup.get(flag.toLowerCase());
+  // Prefer the layered-resolver result keyed by the flag's token id; this is
+  // what carries codec-private / format-private metadata that the
+  // metadata.options pool by itself doesn't surface. Falls back to undefined
+  // when the resolver couldn't classify the flag (unknown-option case).
+  const resolution = resolved.get(binding.tokenIds[0]) ?? null;
+  const optionInfo = resolution?.info;
   const explanation = OPTION_EXPLANATIONS[base];
 
   const valueStr = values.length ? values.join(" ") : "(no value)";
@@ -323,8 +355,12 @@ function buildOptionSelection(
       value: optionInfo?.valueType && optionInfo.valueType !== "none" ? optionInfo.valueType : values.length ? "string" : "none",
     },
   );
+  const sourceLabel = formatResolutionSource(binding);
+  if (sourceLabel) {
+    fields.push({ label: "Source", value: sourceLabel });
+  }
 
-  const specLine = describeStreamSpecifier(specifier);
+  const specLine = describeStreamSpecifier(specifier ?? binding.inferredStreamType ?? null);
   if (specLine) fields.push({ label: "Stream", value: specLine });
 
   const description: string[] = [];
@@ -355,11 +391,7 @@ export function buildSelectionInfo(
 ) {
   const docTokens = versionTokens?.doc;
   const info = new Map<string, SelectionInfo>();
-  const optionLookup = new Map<string, OptionInfo>();
-  metadata.options.options.forEach((opt) => {
-    optionLookup.set(opt.name, opt);
-    opt.aliases.forEach((alias) => optionLookup.set(alias, opt));
-  });
+  const resolved = analysis.resolved;
   const filterLookup = new Map<string, FilterInfo>();
   metadata.filters.filters.forEach((filter) => {
     filterLookup.set(filter.name, filter);
@@ -400,9 +432,8 @@ export function buildSelectionInfo(
         buildOptionSelection(
           "Input-level option",
           "input",
-          opt.flag,
-          opt.values,
-          optionLookup,
+          opt,
+          resolved,
           metadata,
           lookups,
           version,
@@ -429,9 +460,8 @@ export function buildSelectionInfo(
         buildOptionSelection(
           "Output-level option",
           "output",
-          opt.flag,
-          opt.values,
-          optionLookup,
+          opt,
+          resolved,
           metadata,
           lookups,
           version,
@@ -447,12 +477,12 @@ export function buildSelectionInfo(
       buildOptionSelection(
         "Global option",
         "global",
-        opt.flag,
-        opt.values,
-        optionLookup,
+        opt,
+        resolved,
         metadata,
         lookups,
-        version
+        version,
+        docTokens
       )
     );
   });

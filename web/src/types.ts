@@ -17,6 +17,23 @@ export interface OptionBinding {
   inputIndex: number | null;
   outputIndex: number | null;
   tokenIds: string[];
+  /** Where the resolver found this option's metadata. ``"unknown"`` when the
+   * flag matched nothing in any layer (a diagnostic surfaces as
+   * ``unknown-option``). Used by the selection popover to label whether the
+   * binding came from a codec-private table vs the driver layer. */
+  resolutionSource?:
+    | "driver"
+    | "codec-private"
+    | "codec-generic"
+    | "format-private"
+    | "format-generic"
+    | "unknown";
+  /** When ``resolutionSource`` is ``codec-private`` / ``codec-generic``,
+   * the codec name and/or stream type the resolver attributed the option to.
+   * Same for format-private — the muxer/demuxer that owned the option. */
+  matchedCodec?: string;
+  matchedFormat?: string;
+  inferredStreamType?: "v" | "a" | "s";
 }
 
 export interface InputNode {
