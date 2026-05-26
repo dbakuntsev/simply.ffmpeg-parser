@@ -148,6 +148,22 @@ On macOS (Homebrew): `brew install texinfo` (and put
 `$(brew --prefix texinfo)/bin` on your `PATH`, since macOS ships an older
 system `makeinfo`).
 
+On Windows (MSYS2): install [MSYS2](https://www.msys2.org/), then from the
+MSYS2 shell:
+
+```bash
+pacman -Syu                       # update package DB (may require restart)
+pacman -S git texinfo perl tar    # makeinfo + git + Perl runtime + tar
+```
+
+Under MSYS2 both `makeinfo` and `texi2any` are Perl scripts, so the MSYS2
+Perl is required at runtime — `pacman -S texinfo` pulls it in as a
+dependency, listed above explicitly for clarity. To run
+`ffmpeg-metadata-extract` from a regular `cmd.exe` / PowerShell session
+rather than from the MSYS2 shell, put `C:\msys64\usr\bin` on your `PATH`
+(adjust if you installed MSYS2 somewhere else) so Windows can find
+`makeinfo`, `perl`, `tar`, and `git` from outside MSYS2.
+
 ### Installing
 
 From the repo root, install the package in editable mode so the
