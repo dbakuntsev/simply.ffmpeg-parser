@@ -309,6 +309,109 @@ def _normalize_name(value: str) -> str:
 
 _OPTION_NAME_RE = re.compile(r"(-{1,2}[A-Za-z0-9][A-Za-z0-9:._-]*)")
 
+# Mapping from texi @var{type} hint (lowercased var body) to the JSON
+# ``valueType`` the SPA expects. The fallback for any unrecognized but
+# value-bearing hint is ``"string"`` — most ``@var`` content names a placeholder
+# (e.g. ``@var{url}``, ``@var{filename}``) rather than a real type tag.
+_VALUE_TYPE_BY_VAR: dict[str, str] = {
+    "integer": "int",
+    "int": "int",
+    # ``@var{number}`` in ffmpeg.texi is almost always an integer count
+    # (``-vframes number``, ``-stream_loop number``); float-typed quantities
+    # use the more specific ``@var{float}`` / ``@var{double}`` hint.
+    "number": "int",
+    "float": "float",
+    "double": "float",
+    # Rational expressions carry a literal ``num/den`` form (e.g.
+    # ``30000/1001``); represent them as opaque strings rather than floats
+    # to avoid parseFloat() silently truncating the denominator.
+    "rational": "string",
+    "rational number": "string",
+    "boolean": "bool",
+    "bool": "bool",
+    "flags": "flags",
+}
+
+
+def _classify_value_type(fmt: ET.Element) -> str | None:
+    """Inspect ``<var>`` children of ``<itemformat>`` for a scalar type tag.
+
+    Returns one of ``"int"`` / ``"float"`` / ``"bool"`` / ``"flags"`` / ``"string"``
+    when the option carries a value, or ``None`` when no ``<var>`` is found
+    (the caller treats that as the no-value case).
+    """
+    saw_var = False
+    for var in fmt.iter("var"):
+        saw_var = True
+        text = (var.text or "").strip().lower()
+        mapped = _VALUE_TYPE_BY_VAR.get(text)
+        if mapped is not None:
+            return mapped
+    return "string" if saw_var else None
+
+
+def _negation_siblings(
+    entry: ET.Element, primary: OptionEntry
+) -> list[OptionEntry]:
+    """Emit a ``-no<base>`` sibling entry when the primary's description
+    explicitly references one via ``@code{-noflag}`` / ``@option{-noflag}``.
+
+    libavutil's option layer auto-generates a ``-no<flag>`` negation for every
+    boolean AVOption, but the docs only call it out where it matters (e.g.
+    ``-stdin`` mentions ``@code{-nostdin}``). Conservative emission — only
+    surface flags the docs explicitly name — avoids inventing ``-no<flag>``
+    handles that the runtime doesn't actually accept.
+    """
+    if primary.value_type != "none" or not primary.name.startswith("-"):
+        return []
+    target = f"-no{primary.name[1:]}".lower()
+    for tableitem in entry.findall("tableitem"):
+        for elem in tableitem.iter():
+            if elem.tag not in _CODE_TAGS:
+                continue
+            if _plain_text(elem).strip().lower() == target:
+                return [
+                    OptionEntry(
+                        name=target,
+                        aliases=[],
+                        scope=primary.scope,
+                        value_type="none",
+                        values=[],
+                        requires=[],
+                        conflicts=[],
+                        description=[f"Negation form of `{primary.name}`."],
+                        anchor=primary.anchor,
+                        signature=[],
+                    )
+                ]
+    return []
+
+
+def _extract_enum_values(entry: ET.Element) -> list[str]:
+    """Pull enum/flag values from the first ``@table @samp`` nested in the
+    description.
+
+    Items in the inner table may carry parenthetical aliases (e.g.
+    ``@item none (@emph{0})``); only the leading whitespace-separated token
+    survives. Empty list when no ``@samp`` table is present.
+    """
+    for tableitem in entry.findall("tableitem"):
+        for table in tableitem.iter("table"):
+            if table.get("commandarg") != "samp":
+                continue
+            values: list[str] = []
+            for term in table.findall("tableentry/tableterm"):
+                for item in term.findall("item") + term.findall("itemx"):
+                    fmt = item.find("itemformat")
+                    raw = _plain_text(fmt) if fmt is not None else _plain_text(item)
+                    head = raw.split("(", 1)[0].strip()
+                    tokens = head.split()
+                    if tokens:
+                        values.append(tokens[0])
+            if values:
+                return values
+    return []
+
 
 def _scope_for_section(title: str, current: str) -> str:
     lower = title.lower()
@@ -363,6 +466,7 @@ def _extract_options_from_section(
             option = _option_from_entry(entry, scope, entry_anchor)
             if option is not None:
                 sink.append(option)
+                sink.extend(_negation_siblings(entry, option))
             pending_anchor = _trailing_anchor(entry)
     # Recurse into nested subsections (e.g. "Stream specifiers" can have them).
     for sub_tag in ("section", "subsection", "subsubsection"):
@@ -397,18 +501,32 @@ def _option_from_entry(
         return None
 
     names: list[str] = []
-    has_value = False
+    value_type: str = "none"
     signatures: list[str] = []
     for item in items:
         fmt = item.find("itemformat")
-        head = fmt.text if (fmt is not None and fmt.text) else (item.text or "")
-        for name in _OPTION_NAME_RE.findall(head or ""):
+        # Use the full plain text of <itemformat> for name extraction so that
+        # alias forms after the first ``<var>`` child (e.g.
+        # ``-loglevel [<var>flags</var>+]<var>loglevel</var> | -v [<var>flags</var>+]…``)
+        # are still seen by the regex. ``fmt.text`` alone stops at the first
+        # element child and drops every name after it.
+        head = _plain_text(fmt) if fmt is not None else (item.text or "")
+        # Strip the trailing role/scope parenthetical (e.g.
+        # ``(input/output,per-stream)`` or ``(@code{-V})``) before scanning for
+        # option names — the regex would otherwise see ``-stream`` inside
+        # ``per-stream`` or ``-V`` inside the parenthetical and emit them as
+        # spurious aliases. Names always appear before the first ``(``.
+        head_for_names = head.split("(", 1)[0] if head else head
+        for name in _OPTION_NAME_RE.findall(head_for_names or ""):
             names.append(_normalize_name(name))
-        # Presence of <var> or <emph> in itemformat signals the option takes
-        # a value (e.g. ``-i <var>url</var>``).
-        if fmt is not None and (fmt.find("var") is not None or "=" in (fmt.text or "")):
-            has_value = True
         if fmt is not None:
+            classified = _classify_value_type(fmt)
+            if classified is not None and value_type == "none":
+                value_type = classified
+            elif "=" in (fmt.text or "") and value_type == "none":
+                # Items like ``-define key=value`` carry a value via the
+                # ``=`` literal even when no ``@var`` is present.
+                value_type = "string"
             # Render the documented signature with @var/@emph stripped — the
             # raw text preserves the bracket grammar (``[-]input_file_id``,
             # ``[:stream_specifier]``) which the description prose references
@@ -425,12 +543,20 @@ def _option_from_entry(
     for item in entry.findall("tableitem"):
         description_paragraphs.extend(_render_paragraphs(item))
 
+    # Promote to ``enum`` when the description carries an ``@table @samp``
+    # value list. ``flags``-typed options keep their type tag (they accept
+    # ``+a+b`` combinations rather than a single enum match) but still
+    # surface the documented value set.
+    values = _extract_enum_values(entry)
+    if values and value_type not in ("flags",):
+        value_type = "enum"
+
     return OptionEntry(
         name=names[0],
         aliases=names[1:],
         scope=scope,
-        value_type="string" if has_value else "none",
-        values=[],
+        value_type=value_type,
+        values=values,
         requires=[],
         conflicts=[],
         description=description_paragraphs,
@@ -747,9 +873,16 @@ def merge_codec_flags(
 
 def dedupe_options(options: list[OptionEntry]) -> list[OptionEntry]:
     seen: dict[str, OptionEntry] = {}
+    claimed_aliases: set[str] = set()
     for option in options:
-        if option.name not in seen:
-            seen[option.name] = option
+        if option.name in seen or option.name in claimed_aliases:
+            # A later, weaker entry sharing a name with an existing primary
+            # (e.g. ``-v`` appearing both as alias of ``-loglevel`` and as a
+            # stub item somewhere else) is dropped to keep aliases unique.
+            continue
+        seen[option.name] = option
+        for alias in option.aliases:
+            claimed_aliases.add(alias)
     return sorted(seen.values(), key=lambda o: o.name)
 
 
