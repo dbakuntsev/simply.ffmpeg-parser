@@ -22,6 +22,10 @@ export async function loadMetadata(
 
   const index = await fetchVersioned("index.json");
   const options = await fetchVersioned(index.options);
+  // codecs.json and muxers.json grew sibling option arrays (``codec_options``,
+  // ``format_options``) in the S3 extractor pass. Older bundles on disk lack
+  // those keys; the type definitions mark them optional so consumers must
+  // tolerate absence — no normalization needed here.
   const codecs = await fetchVersioned(index.codecs);
   const filters = await fetchVersioned(index.filters);
   // The value-lookup bundles are optional: bundles produced before the

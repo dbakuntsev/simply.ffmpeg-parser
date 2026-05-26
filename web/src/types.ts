@@ -107,7 +107,34 @@ export interface OptionsMetadata {
   }>;
 }
 
+/** A generic AVCodec or AVFormat option, applicable on the command line
+ * when a matching codec/format is selected upstream (e.g. ``-b 5M`` after
+ * ``-c:v libx264``, or ``-fflags +genpts`` near an ``-i input.mp4``).
+ *
+ * Distinct from :class:`OptionsMetadata` entries because the option's scope
+ * isn't ``global``/``input``/``output`` but is derived from ``roles``:
+ *  - AVCodec ``roles`` are drawn from
+ *    ``{encoding, decoding, audio, video, subtitle}``.
+ *  - AVFormat ``roles`` are drawn from ``{input, output}``.
+ * Empty ``roles`` means the documentation didn't tag the entry (option
+ * applies broadly). */
+export interface AVOptionEntry {
+  name: string;
+  aliases: string[];
+  valueType: string;
+  values: string[];
+  description: string[];
+  anchor?: string;
+  signature?: string[];
+  roles: string[];
+}
+
 export interface CodecsMetadata {
+  /** Generic AVCodec options harvested from ``codecs.texi``'s
+   * "Codec Options" chapter. Apply whenever any codec is in scope. Absent
+   * (empty array) on bundles produced before the extractor learned to emit
+   * this layer. */
+  codec_options?: AVOptionEntry[];
   codecs: Array<{
     name: string;
     type: string;
@@ -143,6 +170,12 @@ export interface DemuxersMetadata {
 }
 
 export interface MuxersMetadata {
+  /** Generic AVFormat options harvested from ``formats.texi``'s
+   * "Format Options" chapter. Apply whenever any muxer/demuxer is in scope.
+   * Lives on ``muxers.json`` (single home for both sides) — the SPA reads
+   * it for both input-side and output-side lookups. Absent on bundles
+   * produced before the extractor learned to emit this layer. */
+  format_options?: AVOptionEntry[];
   muxers: NamedEntry[];
 }
 

@@ -14,16 +14,19 @@ from .config_texi import generate_config_texi
 from .git_utils import list_tags, show_file, tag_date_iso, temporary_worktree
 from .models import ExtractConfig
 from .parsing import (
+    dedupe_av_options,
     dedupe_codecs,
     dedupe_filters,
     dedupe_named,
     dedupe_options,
     merge_codec_flags,
     parse_bitstream_filters_xml,
+    parse_codec_options_xml,
     parse_codecs_c,
     parse_codecs_xml,
     parse_demuxers_xml,
     parse_filters_xml,
+    parse_format_options_xml,
     parse_muxers_xml,
     parse_options_xml,
     parse_protocols_xml,
@@ -289,6 +292,48 @@ def _extract_codecs(
     return sorted(documented + extras, key=lambda c: c["name"])
 
 
+def _av_option_to_dict(o) -> dict:
+    return {
+        "name": o.name,
+        "aliases": o.aliases,
+        "valueType": o.value_type,
+        "values": o.values,
+        "description": o.description,
+        "anchor": o.anchor,
+        "signature": o.signature,
+        "roles": o.roles,
+    }
+
+
+def _extract_codec_options(
+    doc_root: Path, makeinfo_cmd: list[str], logger: Logger
+) -> list[dict]:
+    """Parse the generic AVCodec options chapter from ``codecs.texi``.
+
+    Missing/unparseable source returns an empty list — older tags' docs may
+    not carry the chapter, and we don't want to fail extraction over it.
+    The SPA tolerates an absent ``codec_options`` array.
+    """
+    root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger)
+    if root is None:
+        logger.debug("codecs.texi not found; codec_options will be empty")
+        return []
+    logger.debug("Parsing codec_options from codecs.texi")
+    return [_av_option_to_dict(o) for o in dedupe_av_options(parse_codec_options_xml(root))]
+
+
+def _extract_format_options(
+    doc_root: Path, makeinfo_cmd: list[str], logger: Logger
+) -> list[dict]:
+    """Parse the generic AVFormat options chapter from ``formats.texi``."""
+    root = _load_xml(doc_root, "formats.texi", makeinfo_cmd, logger)
+    if root is None:
+        logger.debug("formats.texi not found; format_options will be empty")
+        return []
+    logger.debug("Parsing format_options from formats.texi")
+    return [_av_option_to_dict(o) for o in dedupe_av_options(parse_format_options_xml(root))]
+
+
 def _extract_filters(doc_root: Path, makeinfo_cmd: list[str], logger: Logger) -> list[dict]:
     root = _load_xml(doc_root, "filters.texi", makeinfo_cmd, logger)
     if root is None:
@@ -418,7 +463,11 @@ def _extract_and_write(
             codecs = _extract_codecs(
                 doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger
             )
-            _write_json(output_dir / "codecs.json", {"codecs": codecs})
+            codec_options = _extract_codec_options(doc_root, makeinfo_cmd, logger)
+            _write_json(
+                output_dir / "codecs.json",
+                {"codec_options": codec_options, "codecs": codecs},
+            )
 
         if "filters" in config.categories:
             filters = _extract_filters(doc_root, makeinfo_cmd, logger)
@@ -436,7 +485,11 @@ def _extract_and_write(
                 doc_root, "muxers.texi", parse_muxers_xml, "muxers",
                 makeinfo_cmd, logger,
             )
-            _write_json(output_dir / "muxers.json", {"muxers": muxers})
+            format_options = _extract_format_options(doc_root, makeinfo_cmd, logger)
+            _write_json(
+                output_dir / "muxers.json",
+                {"format_options": format_options, "muxers": muxers},
+            )
 
         if "protocols" in config.categories:
             protocols = _extract_named(

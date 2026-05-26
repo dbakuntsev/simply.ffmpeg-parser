@@ -44,6 +44,30 @@ class OptionEntry:
 
 
 @dataclass(frozen=True)
+class AVOptionEntry:
+    """An AVCodec or AVFormat option — applies on the command line when a
+    matching codec/format is in scope (e.g. ``-b 5M`` after ``-c:v libx264``,
+    or ``-fflags +genpts`` near an ``-i input.mp4``).
+
+    Distinct from :class:`OptionEntry` because the option's applicability is
+    not "global/input/output" but tied to *role tags* parsed from the doc's
+    ``(@emph{...})`` parenthetical. AVCodec entries get tags drawn from
+    ``{encoding, decoding, audio, video, subtitles}``; AVFormat entries draw
+    from ``{input, output}``. An empty ``roles`` list means the documentation
+    didn't tag the entry (option applies broadly).
+    """
+
+    name: str           # leading "-" included, same convention as OptionEntry
+    aliases: list[str]
+    value_type: str
+    values: list[str]
+    description: list[str]
+    anchor: str = ""
+    signature: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class CodecEntry:
     name: str
     type: str
