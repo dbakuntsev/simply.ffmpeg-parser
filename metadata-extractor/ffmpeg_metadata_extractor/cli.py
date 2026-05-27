@@ -127,6 +127,19 @@ def main() -> int:
             "enumerated values for them)."
         ),
     )
+    parser.add_argument(
+        "--x265-repo",
+        dest="x265_repo",
+        metavar="PATH",
+        help=(
+            "Optional path to an upstream x265 git checkout. Like "
+            "--x264-repo but for libx265's -preset / -tune / -profile. "
+            "Snapshot is pinned to the most recent stable release tag "
+            "(matching \\d+\\.\\d+(\\.\\d+)?) at or before the FFmpeg tag's "
+            "release date, so older FFmpeg bundles get an "
+            "approximately-contemporary x265 view."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -151,6 +164,7 @@ def main() -> int:
 
     jobs = max(1, args.jobs)
     x264_repo = Path(args.x264_repo) if args.x264_repo else None
+    x265_repo = Path(args.x265_repo) if args.x265_repo else None
 
     config = ExtractConfig(
         repo=Path(args.repo),
@@ -165,6 +179,7 @@ def main() -> int:
         html_doc=args.html_doc,
         jobs=jobs,
         x264_repo=x264_repo,
+        x265_repo=x265_repo,
     )
 
     return run_extraction(config)

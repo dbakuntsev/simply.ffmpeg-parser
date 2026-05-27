@@ -28,6 +28,13 @@ class ExtractConfig:
     # values for them). ``None`` skips the enrichment entirely — those
     # options just surface without a "Valid values" section.
     x264_repo: Path | None = None
+    # Optional path to an upstream x265 git checkout. Mirrors x264_repo
+    # for libx265's ``-preset`` / ``-tune`` / ``-profile`` (same
+    # AV_OPT_TYPE_STRING passthrough pattern). Unlike x264, x265 publishes
+    # release tags, so the snapshot is pinned to the most recent stable
+    # tag at or before the FFmpeg release date rather than a free-floating
+    # commit. See :func:`.git_utils.tag_at_or_before`.
+    x265_repo: Path | None = None
 
 
 @dataclass(frozen=True)
