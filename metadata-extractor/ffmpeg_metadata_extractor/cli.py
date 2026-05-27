@@ -114,6 +114,19 @@ def main() -> int:
             "historical sequential behavior."
         ),
     )
+    parser.add_argument(
+        "--x264-repo",
+        dest="x264_repo",
+        metavar="PATH",
+        help=(
+            "Optional path to an upstream x264 git checkout. When set, "
+            "the extractor parses x264.c's verbose help text to fill in "
+            "valid values + descriptions for libx264's -preset / -tune / "
+            "-profile (which FFmpeg declares as plain strings and passes "
+            "through to x264, so the AVOption-array parser sees no "
+            "enumerated values for them)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -137,6 +150,7 @@ def main() -> int:
     categories = _parse_categories(args.categories)
 
     jobs = max(1, args.jobs)
+    x264_repo = Path(args.x264_repo) if args.x264_repo else None
 
     config = ExtractConfig(
         repo=Path(args.repo),
@@ -150,6 +164,7 @@ def main() -> int:
         worktree_fallback=args.worktree_fallback,
         html_doc=args.html_doc,
         jobs=jobs,
+        x264_repo=x264_repo,
     )
 
     return run_extraction(config)

@@ -32,6 +32,28 @@ def tag_date_iso(repo: Path, tag: str) -> str | None:
     return value or None
 
 
+def commit_at_or_before(repo: Path, iso_date: str, branch: str = "HEAD") -> str | None:
+    """Return the SHA of the most recent commit on ``branch`` whose
+    committer date is ``<= iso_date``, or ``None`` if no such commit
+    exists (i.e. the branch's first commit is newer than the date).
+
+    Used to pin an external repository — e.g. x264 — to an
+    approximately-contemporary snapshot for each FFmpeg release tag.
+    ``iso_date`` should be a string git understands (RFC 3339 / ISO 8601);
+    the output of :func:`tag_date_iso` works directly.
+    """
+    try:
+        result = run_git(
+            repo,
+            ["log", "-1", f"--before={iso_date}", "--format=%H", branch],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def show_file(repo: Path, tag: str, path: str) -> str | None:
     try:
         result = run_git(repo, ["show", f"{tag}:{path}"])

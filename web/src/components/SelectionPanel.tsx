@@ -113,7 +113,11 @@ export function SelectionPanel({ selection, onClose }: Props) {
                   {selection.values!.map((row) => (
                     <div key={row.name} className="contents">
                       <dt className="font-mono text-ink">{row.name}</dt>
-                      <dd className="text-ink/80">{row.description || <span className="text-muted">—</span>}</dd>
+                      {/* whitespace-pre-line so multi-line descriptions
+                          (e.g. libx264 -preset's flag lists, which arrive
+                          with embedded newlines from x264.c's help text)
+                          render with their original line breaks. */}
+                      <dd className="whitespace-pre-line text-ink/80">{row.description || <span className="text-muted">—</span>}</dd>
                     </div>
                   ))}
                 </dl>

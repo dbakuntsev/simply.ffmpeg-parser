@@ -20,6 +20,14 @@ class ExtractConfig:
     # 1 keeps the historical sequential behavior. The driver clamps to
     # ``len(selected_tags)`` so we never spin up idle workers.
     jobs: int = 1
+    # Optional path to an upstream x264 git checkout. When set, the
+    # extractor parses ``x264.c``'s verbose help text to enrich the
+    # libx264 codec's ``-preset`` / ``-tune`` / ``-profile`` options
+    # (FFmpeg declares those as ``AV_OPT_TYPE_STRING`` and forwards the
+    # string to x264, so the AVOption-array parser finds no enumerated
+    # values for them). ``None`` skips the enrichment entirely — those
+    # options just surface without a "Valid values" section.
+    x264_repo: Path | None = None
 
 
 @dataclass(frozen=True)

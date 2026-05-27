@@ -20,8 +20,15 @@ from .avopt_c import (
     enrich_options_with_c_values,
 )
 from .config_texi import generate_config_texi
-from .git_utils import list_tags, show_file, tag_date_iso, temporary_worktree
+from .git_utils import (
+    commit_at_or_before,
+    list_tags,
+    show_file,
+    tag_date_iso,
+    temporary_worktree,
+)
 from .models import AVOptionEntry, ExtractConfig
+from .x264_help import parse_x264_help
 from .parsing import (
     dedupe_av_options,
     dedupe_codecs,
@@ -353,6 +360,42 @@ def _extract_options(
     raise ExtractionError("Options sources not found")
 
 
+def _layer_x264_string_values(
+    codec: dict, x264_help: dict[str, list[tuple[str, str]]]
+) -> None:
+    """Overlay value lists + descriptions from ``x264 --fullhelp`` onto
+    libx264's string-typed options.
+
+    FFmpeg declares ``-preset`` / ``-tune`` / ``-profile`` as
+    ``AV_OPT_TYPE_STRING`` and forwards the value straight through to
+    ``x264_param_default_preset`` / ``_default_profile``, so the
+    AVOption-array parser sees no enumerated values. This mutates the
+    codec dict in place to fill them in for the libx264 codec family
+    (covering ``libx264``/``libx264rgb``/``libx262`` — they all share
+    the same x264 preset machinery).
+
+    Existing values from another source (e.g. an alternate enrichment
+    that wins earlier) are left alone — we only fill empty value lists.
+    """
+    if not x264_help:
+        return
+    family = {codec.get("name", "").lower(), *(
+        a.lower() for a in codec.get("aliases", [])
+    )}
+    if not family & {"libx264", "libx264rgb", "libx262"}:
+        return
+    for opt in codec.get("options", []):
+        bare = opt["name"][1:] if opt["name"].startswith("-") else opt["name"]
+        entries = x264_help.get(bare)
+        if not entries:
+            continue
+        if opt.get("values"):
+            # An earlier enrichment already populated values — defer to it.
+            continue
+        opt["values"] = [name for name, _ in entries]
+        opt["valueDescriptions"] = [desc for _, desc in entries]
+
+
 def _extract_codecs(
     doc_root: Path,
     repo: Path,
@@ -362,6 +405,7 @@ def _extract_codecs(
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
     xml_cache: dict[str, ET.Element | None],
+    x264_help: dict[str, list[tuple[str, str]]],
 ) -> list[dict]:
     root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger, xml_cache)
     codecs_from_doc = dedupe_codecs(parse_codecs_xml(root)) if root is not None else []
@@ -453,6 +497,10 @@ def _extract_codecs(
             opts, c_map, [c["name"], *c.get("aliases", [])]
         )
         c["options"] = [_av_option_to_dict(o) for o in enriched]
+        # Fill values+descriptions for libx264's string-typed pass-through
+        # options (--preset/--tune/--profile) from the upstream x264 help
+        # text. No-op for every other codec.
+        _layer_x264_string_values(c, x264_help)
 
     return codecs
 
@@ -707,6 +755,50 @@ def _extract_and_write(
         # repeated lookup doesn't re-emit the makeinfo-failed warning.
         xml_cache: dict[str, ET.Element | None] = {}
 
+        # Upstream x264 help text — pinned to the x264 commit at or
+        # before this FFmpeg tag's release date so older bundles get an
+        # approximately-contemporary preset/tune/profile set rather than
+        # today's HEAD. x264 carries no tags or release branches, so the
+        # date is the only signal we have for "which x264 was shipping
+        # at the time this FFmpeg was tagged." Parsing is cheap (~5ms);
+        # we just re-parse per tag rather than thread a shared map
+        # through the worker pool.
+        x264_help: dict[str, list[tuple[str, str]]] = {}
+        if config.x264_repo is not None:
+            if not released:
+                logger.warn(
+                    "x264 enrichment skipped: FFmpeg tag has no committer date"
+                )
+            else:
+                commit = commit_at_or_before(config.x264_repo, released)
+                if commit is None:
+                    logger.warn(
+                        f"x264 enrichment skipped: no x264 commit at or before "
+                        f"{released}"
+                    )
+                else:
+                    x264_c_text = show_file(config.x264_repo, commit, "x264.c")
+                    if x264_c_text is None:
+                        logger.warn(
+                            f"x264 enrichment skipped: x264.c not found at "
+                            f"commit {commit[:12]}"
+                        )
+                    else:
+                        x264_help = parse_x264_help(x264_c_text)
+                        if x264_help:
+                            counts = ", ".join(
+                                f"{k}={len(v)}" for k, v in sorted(x264_help.items())
+                            )
+                            logger.debug(
+                                f"Parsed x264 help from commit {commit[:12]} "
+                                f"(<= {released}): {counts}"
+                            )
+                        else:
+                            logger.warn(
+                                f"x264 help text empty at commit {commit[:12]}; "
+                                "libx264 -preset/-tune/-profile won't get values"
+                            )
+
         if "options" in config.categories:
             options = _extract_options(doc_root, makeinfo_cmd, logger, xml_cache)
             _write_json(output_dir / "options.json", {"options": options})
@@ -714,7 +806,7 @@ def _extract_and_write(
         if "codecs" in config.categories:
             codecs = _extract_codecs(
                 doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger,
-                c_map, xml_cache,
+                c_map, xml_cache, x264_help,
             )
             codec_options = _extract_codec_options(
                 doc_root, makeinfo_cmd, logger, c_map, xml_cache,
