@@ -20,6 +20,8 @@ env:
   EXTRACTOR_RANGE: n3.4.0..n9999.9999.9999
   X264_REPO: https://code.videolan.org/videolan/x264.git
   X264_SRC_DIR: ${{ github.workspace }}/.x264-src
+  X265_REPO: https://bitbucket.org/multicoreware/x265_git.git
+  X265_SRC_DIR: ${{ github.workspace }}/.x265-src
 
 jobs:
   build:
@@ -96,11 +98,34 @@ jobs:
             git clone --no-checkout "${X264_REPO}" "${X264_SRC_DIR}"
           fi
 
+      - name: Restore x265 git clone cache
+        id: x265-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.X265_SRC_DIR }}
+          key: x265-git-${{ github.run_id }}
+          restore-keys: |
+            x265-git-
+
+      - name: Clone or update x265 sources
+        run: |
+          set -euo pipefail
+          if [ -d "${X265_SRC_DIR}/.git" ]; then
+            echo "Updating existing x265 clone…"
+            git -C "${X265_SRC_DIR}" remote set-url origin "${X265_REPO}"
+            git -C "${X265_SRC_DIR}" fetch --prune --tags --force origin
+          else
+            echo "Cloning x265 from ${X265_REPO}…"
+            rm -rf "${X265_SRC_DIR}"
+            git clone --no-checkout "${X265_REPO}" "${X265_SRC_DIR}"
+          fi
+
       - name: Extract FFmpeg metadata + documentation
         run: |
           ffmpeg-metadata-extract \
             --repo "${FFMPEG_SRC_DIR}" \
             --x264-repo "${X264_SRC_DIR}" \
+            --x265-repo "${X265_SRC_DIR}" \
             --out web/public \
             --range "${EXTRACTOR_RANGE}" \
             --latest-per-minor \
