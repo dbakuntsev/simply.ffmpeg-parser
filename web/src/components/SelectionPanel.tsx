@@ -57,7 +57,7 @@ export function SelectionPanel({ selection, onClose }: Props) {
 
   useEffect(() => {
     closeButtonRef.current?.focus();
-  }, [selection]);
+  }, []);
 
   const hasFields = !!(selection.fields && selection.fields.length > 0);
   const hasDescription = !!(selection.description && selection.description.length > 0);
