@@ -269,16 +269,49 @@ function validateOptionValue(optionInfo: { valueType: string; values: string[] }
     }
   }
 
-  if (optionInfo.valueType === "enum" && optionInfo.values && optionInfo.values.length > 0) {
+  if (
+    (optionInfo.valueType === "enum" || optionInfo.valueType === "string") &&
+    optionInfo.values &&
+    optionInfo.values.length > 0
+  ) {
     if (!optionInfo.values.includes(trimmed)) {
       return {
         severity: "warning" as const,
         code: "invalid-enum",
         message: `Unexpected value "${value}"`,
-        explanation: `Expected one of: ${optionInfo.values.join(", ")}.`,
+        explanation: `Expected one of: ${formatValueList(optionInfo.values)}.`,
       };
     }
   }
 
+  if (optionInfo.valueType === "flags" && optionInfo.values && optionInfo.values.length > 0) {
+    // Numeric bitmasks like ``0x40`` or ``42`` bypass the named-flag check.
+    if (!/^(?:0[xX][0-9a-fA-F]+|-?\d+)$/.test(trimmed)) {
+      const unknown: string[] = [];
+      const allowed = new Set(optionInfo.values);
+      // Tokens are separated by ``+`` or ``-`` (and a leading sign is optional).
+      // Split, drop empties, check each.
+      for (const tok of trimmed.split(/[+\-]/)) {
+        const name = tok.trim();
+        if (!name) continue;
+        if (!allowed.has(name)) unknown.push(name);
+      }
+      if (unknown.length > 0) {
+        return {
+          severity: "warning" as const,
+          code: "invalid-flag",
+          message: `Unknown flag${unknown.length > 1 ? "s" : ""} ${unknown.map((n) => `"${n}"`).join(", ")}`,
+          explanation: `Expected ${unknown.length > 1 ? "names" : "a name"} from: ${formatValueList(optionInfo.values)}.`,
+        };
+      }
+    }
+  }
+
   return null;
+}
+
+function formatValueList(values: string[]): string {
+  const MAX = 12;
+  if (values.length <= MAX) return values.join(", ");
+  return `${values.slice(0, MAX).join(", ")}, … (${values.length - MAX} more)`;
 }
