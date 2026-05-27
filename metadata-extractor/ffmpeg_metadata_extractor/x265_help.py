@@ -26,6 +26,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .x264_help import UpstreamOptionHelp
+
 
 # ``if (!strcmp(NAME_VAR, "VALUE"))`` — ``NAME_VAR`` is ``preset``,
 # ``tune``, or ``profile`` depending on which function we're inside.
@@ -207,8 +209,14 @@ def _extract_profile_names(body: str) -> list[tuple[str, str]]:
 
 def parse_x265_help(
     param_cpp: str, level_cpp: str
-) -> dict[str, list[tuple[str, str]]]:
-    """Return ``{option: [(value, description)]}`` for preset / tune / profile.
+) -> dict[str, UpstreamOptionHelp]:
+    """Return ``{option: UpstreamOptionHelp}`` for preset / tune / profile.
+
+    Returns the same schema as :func:`.x264_help.parse_x264_help` so the
+    extractor's layering helper can consume both uniformly. x265's CLI
+    help carries no meaningful per-option header description (just bare
+    value-name lists), so ``description`` stays empty here — only the
+    ``values`` field is populated.
 
     ``param_cpp``: contents of ``source/common/param.cpp`` — supplies
     presets + tunes.
@@ -218,7 +226,7 @@ def parse_x265_help(
     Either argument may be empty; the corresponding entries simply don't
     appear in the result.
     """
-    out: dict[str, list[tuple[str, str]]] = {}
+    out: dict[str, UpstreamOptionHelp] = {}
 
     if param_cpp:
         clean = _strip_comments(param_cpp)
@@ -226,10 +234,10 @@ def parse_x265_help(
         if body:
             presets = _extract_strcmp_cascade(body, "preset")
             if presets:
-                out["preset"] = presets
+                out["preset"] = UpstreamOptionHelp(values=presets)
             tunes = _extract_strcmp_cascade(body, "tune")
             if tunes:
-                out["tune"] = tunes
+                out["tune"] = UpstreamOptionHelp(values=tunes)
 
     if level_cpp:
         clean = _strip_comments(level_cpp)
@@ -237,6 +245,6 @@ def parse_x265_help(
         if body:
             profiles = _extract_profile_names(body)
             if profiles:
-                out["profile"] = profiles
+                out["profile"] = UpstreamOptionHelp(values=profiles)
 
     return out

@@ -29,7 +29,7 @@ from .git_utils import (
     temporary_worktree,
 )
 from .models import AVOptionEntry, ExtractConfig
-from .x264_help import parse_x264_help
+from .x264_help import UpstreamOptionHelp, parse_x264_help
 from .x265_help import parse_x265_help
 
 # Pre-compiled regex matching x265's stable release tags only — pre-release
@@ -374,21 +374,37 @@ _X265_FAMILY = frozenset({"libx265"})
 
 def _layer_upstream_string_values(
     codec: dict,
-    help_map: dict[str, list[tuple[str, str]]],
+    help_map: dict[str, UpstreamOptionHelp],
     family: frozenset[str],
+    source_label: str,
 ) -> None:
-    """Overlay value lists + descriptions from an upstream library's
-    source onto a codec's string-typed options.
+    """Overlay upstream library help onto a codec's options.
 
     Some libraries — notably x264 and x265 — accept their own
     ``-preset`` / ``-tune`` / ``-profile`` as opaque strings that FFmpeg
-    forwards verbatim. The AVOption-array parser therefore sees no
-    enumerated values for those options; this layer fills them in from
-    a help map produced by :mod:`.x264_help` / :mod:`.x265_help`.
+    forwards verbatim. They also document many of their other options
+    (``--crf``, ``--qp``, ``--aq-mode``, …) in their CLI help, often
+    with information FFmpeg's terse texi doesn't include (default
+    values, ranges, per-value semantics).
+
+    For every FFmpeg option whose bare name (e.g. ``crf`` from ``-crf``)
+    matches an entry in ``help_map``:
+
+    - **Value list**: filled from ``info.values`` when the FFmpeg option
+      currently has none. This is the preset/tune/profile case.
+    - **Description**: ``info.description`` is appended to the FFmpeg
+      option's description list as a clearly-attributed markdown
+      paragraph. Skipped if the same line is already present (idempotent
+      across re-extractions).
+
+    Pure name-equality matching — no hardcoded translation table. Options
+    whose FFmpeg spelling diverges from the upstream CLI spelling (e.g.
+    FFmpeg's ``-coder`` vs x264's ``--no-cabac``) simply pass through
+    unenriched.
 
     ``family`` is the lowercase set of codec names this map applies to
-    (e.g. ``{"libx264", "libx264rgb", "libx262"}`` for x264's). Existing
-    non-empty value lists win — we only fill gaps.
+    (e.g. ``{"libx264", "libx264rgb", "libx262"}``). ``source_label``
+    appears in the rendered attribution (``**From upstream x264:** ...``).
     """
     if not help_map:
         return
@@ -397,16 +413,25 @@ def _layer_upstream_string_values(
     )}
     if not names & family:
         return
+    attribution_prefix = f"**From upstream {source_label}:**"
     for opt in codec.get("options", []):
         bare = opt["name"][1:] if opt["name"].startswith("-") else opt["name"]
-        entries = help_map.get(bare)
-        if not entries:
+        info = help_map.get(bare)
+        if info is None:
             continue
-        if opt.get("values"):
-            # An earlier enrichment already populated values — defer to it.
-            continue
-        opt["values"] = [name for name, _ in entries]
-        opt["valueDescriptions"] = [desc for _, desc in entries]
+        # Value-list overlay (preset/tune/profile case).
+        if info.values and not opt.get("values"):
+            opt["values"] = [name for name, _ in info.values]
+            opt["valueDescriptions"] = [desc for _, desc in info.values]
+        # Description overlay: append the upstream header text as an
+        # extra markdown paragraph, clearly attributed so the reader
+        # knows which source it came from. De-duped by attribution
+        # prefix so repeated runs don't pile up identical lines.
+        if info.description:
+            existing = list(opt.get("description") or [])
+            if not any(p.startswith(attribution_prefix) for p in existing):
+                existing.append(f"{attribution_prefix} {info.description}")
+                opt["description"] = existing
 
 
 def _extract_codecs(
@@ -418,8 +443,8 @@ def _extract_codecs(
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
     xml_cache: dict[str, ET.Element | None],
-    x264_help: dict[str, list[tuple[str, str]]],
-    x265_help: dict[str, list[tuple[str, str]]],
+    x264_help: dict[str, UpstreamOptionHelp],
+    x265_help: dict[str, UpstreamOptionHelp],
 ) -> list[dict]:
     root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger, xml_cache)
     codecs_from_doc = dedupe_codecs(parse_codecs_xml(root)) if root is not None else []
@@ -515,8 +540,8 @@ def _extract_codecs(
         # passthrough options (-preset / -tune / -profile) from the
         # upstream library sources. Both calls are no-ops for codecs
         # outside their respective family.
-        _layer_upstream_string_values(c, x264_help, _X264_FAMILY)
-        _layer_upstream_string_values(c, x265_help, _X265_FAMILY)
+        _layer_upstream_string_values(c, x264_help, _X264_FAMILY, "x264")
+        _layer_upstream_string_values(c, x265_help, _X265_FAMILY, "x265")
 
     return codecs
 
@@ -778,7 +803,7 @@ def _extract_and_write(
         # commit date is the only signal we have. Parsing is cheap
         # (~5ms); we just re-parse per tag rather than thread a shared
         # map through the worker pool.
-        x264_help: dict[str, list[tuple[str, str]]] = {}
+        x264_help: dict[str, UpstreamOptionHelp] = {}
         if config.x264_repo is not None:
             if not released:
                 logger.warn(
@@ -799,14 +824,35 @@ def _extract_and_write(
                             f"commit {commit[:12]}"
                         )
                     else:
-                        x264_help = parse_x264_help(x264_c_text)
+                        # Optional auxiliary sources so the parser can
+                        # resolve printf-style placeholders (``%d``,
+                        # ``%.1f``, …) in the descriptions to actual
+                        # constants and default values. Each is
+                        # best-effort: missing → that resolution path
+                        # is just skipped, the rest still works.
+                        base_c = show_file(
+                            config.x264_repo, commit, "common/base.c"
+                        ) or ""
+                        common_h = show_file(
+                            config.x264_repo, commit, "common/common.h"
+                        ) or ""
+                        x264_h = show_file(
+                            config.x264_repo, commit, "x264.h"
+                        ) or ""
+                        x264_help = parse_x264_help(
+                            x264_c_text,
+                            base_c=base_c,
+                            common_h=common_h,
+                            x264_h=x264_h,
+                        )
                         if x264_help:
-                            counts = ", ".join(
-                                f"{k}={len(v)}" for k, v in sorted(x264_help.items())
-                            )
+                            with_values = sum(1 for v in x264_help.values() if v.values)
+                            with_desc = sum(1 for v in x264_help.values() if v.description)
                             logger.debug(
                                 f"Parsed x264 help from commit {commit[:12]} "
-                                f"(<= {released}): {counts}"
+                                f"(<= {released}): {len(x264_help)} options "
+                                f"({with_values} with value lists, "
+                                f"{with_desc} with descriptions)"
                             )
                         else:
                             logger.warn(
@@ -818,7 +864,7 @@ def _extract_and_write(
         # so the snapshot is pinned to the most recent stable tag at or
         # before the FFmpeg release date. Reads two C++ files (param.cpp
         # for presets+tunes, level.cpp for profile names) at that tag.
-        x265_help: dict[str, list[tuple[str, str]]] = {}
+        x265_help: dict[str, UpstreamOptionHelp] = {}
         if config.x265_repo is not None:
             if not released:
                 logger.warn(
@@ -843,7 +889,8 @@ def _extract_and_write(
                     x265_help = parse_x265_help(param_cpp, level_cpp)
                     if x265_help:
                         counts = ", ".join(
-                            f"{k}={len(v)}" for k, v in sorted(x265_help.items())
+                            f"{k}={len(v.values)}"
+                            for k, v in sorted(x265_help.items())
                         )
                         logger.debug(
                             f"Parsed x265 help from tag {x265_tag} "
