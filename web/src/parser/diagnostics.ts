@@ -6,7 +6,7 @@ import { splitStreamSpecifier } from "./streamSpecifier";
 export function detectIssues(
   tokens: Token[],
   semantic: SemanticCommand,
-  _metadata: MetadataBundle,
+  metadata: MetadataBundle,
   resolved: Map<string, ResolvedOption | null>
 ): Issue[] {
   const issues: Issue[] = [];
@@ -118,6 +118,112 @@ export function detectIssues(
       scope: "output",
       relatedIds: [],
     });
+  }
+
+  issues.push(...validateNamedValues(tokens, metadata));
+
+  return issues;
+}
+
+const CODEC_VALUE_BASES = new Set(["-c", "-codec", "-vcodec", "-acodec", "-scodec"]);
+
+function buildNameSet(entries: { name: string; aliases?: string[] }[] | undefined): Set<string> {
+  const set = new Set<string>();
+  for (const e of entries ?? []) {
+    set.add(e.name.toLowerCase());
+    for (const a of e.aliases || []) set.add(a.toLowerCase());
+  }
+  return set;
+}
+
+function validateNamedValues(tokens: Token[], metadata: MetadataBundle): Issue[] {
+  const issues: Issue[] = [];
+
+  const codecs = buildNameSet(metadata.codecs?.codecs);
+  const muxers = buildNameSet(metadata.muxers?.muxers);
+  const demuxers = buildNameSet(metadata.demuxers?.demuxers);
+  const bsfs = buildNameSet(metadata.bitstreamFilters?.bitstream_filters);
+
+  let seenInput = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token.type !== "flag") continue;
+
+    if (token.normalizedText === "-i") {
+      seenInput = true;
+      continue;
+    }
+
+    const valueToken = tokens[i + 1];
+    if (!valueToken || valueToken.type === "flag") continue;
+    const value = valueToken.text;
+    if (!value) continue;
+
+    const { base } = splitStreamSpecifier(token.normalizedText);
+
+    if (CODEC_VALUE_BASES.has(base)) {
+      // ``copy`` is a passthrough pseudo-codec, always valid.
+      if (value.toLowerCase() === "copy") continue;
+      if (codecs.size === 0) continue;
+      if (!codecs.has(value.toLowerCase())) {
+        issues.push({
+          id: nextIssueId(),
+          severity: "warning",
+          code: "unknown-codec",
+          message: `Unknown codec "${value}"`,
+          explanation: `"${value}" is not a codec known to this FFmpeg version. Check for typos or select a different version.`,
+          tokenIds: [token.id, valueToken.id],
+          scope: seenInput ? "output" : "input",
+          relatedIds: [],
+        });
+      }
+      continue;
+    }
+
+    if (base === "-f") {
+      const side: "muxer" | "demuxer" = seenInput ? "muxer" : "demuxer";
+      const set = side === "muxer" ? muxers : demuxers;
+      if (set.size === 0) continue;
+      if (!set.has(value.toLowerCase())) {
+        issues.push({
+          id: nextIssueId(),
+          severity: "warning",
+          code: side === "muxer" ? "unknown-muxer" : "unknown-demuxer",
+          message: `Unknown ${side} "${value}"`,
+          explanation: `"${value}" is not a ${side} known to this FFmpeg version. Check for typos or select a different version.`,
+          tokenIds: [token.id, valueToken.id],
+          scope: side === "muxer" ? "output" : "input",
+          relatedIds: [],
+        });
+      }
+      continue;
+    }
+
+    if (base === "-bsf") {
+      if (bsfs.size === 0) continue;
+      // Value form: ``name1[=args],name2[=args],...``. Args may themselves
+      // contain ``=``, so only split off the first ``=`` on each segment.
+      for (const segment of value.split(",")) {
+        const trimmed = segment.trim();
+        if (!trimmed) continue;
+        const eq = trimmed.indexOf("=");
+        const name = (eq === -1 ? trimmed : trimmed.slice(0, eq)).trim();
+        if (!name) continue;
+        if (!bsfs.has(name.toLowerCase())) {
+          issues.push({
+            id: nextIssueId(),
+            severity: "warning",
+            code: "unknown-bitstream-filter",
+            message: `Unknown bitstream filter "${name}"`,
+            explanation: `"${name}" is not a bitstream filter known to this FFmpeg version. Check for typos or select a different version.`,
+            tokenIds: [token.id, valueToken.id],
+            scope: "output",
+            relatedIds: [],
+          });
+        }
+      }
+      continue;
+    }
   }
 
   return issues;
