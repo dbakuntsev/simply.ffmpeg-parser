@@ -1,8 +1,17 @@
 ﻿import argparse
+import os
 from pathlib import Path
 
 from .asset_check import check_assets
 from .extractor import ExtractConfig, run_extraction
+
+
+def _default_jobs() -> int:
+    """Default parallelism: capped at 8 to keep git/disk contention bounded
+    and to play nicely on shared CI runners. Falls back to 1 when
+    ``os.cpu_count()`` is unavailable.
+    """
+    return min(8, os.cpu_count() or 1)
 
 
 _ALL_CATEGORIES = {
@@ -94,6 +103,17 @@ def main() -> int:
         default=True,
         help="Skip generating ffmpeg-all.html via makeinfo --html",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=_default_jobs(),
+        metavar="N",
+        help=(
+            "Number of worker processes used to extract distinct tags in "
+            "parallel. Defaults to min(8, cpu_count). Set to 1 for the "
+            "historical sequential behavior."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -116,6 +136,8 @@ def main() -> int:
 
     categories = _parse_categories(args.categories)
 
+    jobs = max(1, args.jobs)
+
     config = ExtractConfig(
         repo=Path(args.repo),
         out=Path(args.out),
@@ -127,6 +149,7 @@ def main() -> int:
         continue_on_error=args.continue_on_error,
         worktree_fallback=args.worktree_fallback,
         html_doc=args.html_doc,
+        jobs=jobs,
     )
 
     return run_extraction(config)

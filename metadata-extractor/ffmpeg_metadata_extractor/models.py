@@ -16,6 +16,10 @@ class ExtractConfig:
     continue_on_error: bool
     worktree_fallback: bool
     html_doc: bool
+    # Number of parallel worker processes used to extract distinct tags.
+    # 1 keeps the historical sequential behavior. The driver clamps to
+    # ``len(selected_tags)`` so we never spin up idle workers.
+    jobs: int = 1
 
 
 @dataclass(frozen=True)

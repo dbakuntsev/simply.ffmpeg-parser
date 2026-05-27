@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing
 import re
 import shutil
 import subprocess
@@ -50,19 +52,88 @@ _SHARED_CSS_FILES = ("bootstrap.min.css", "style.min.css")
 _VENDORED_T2H = "t2h.pm"
 
 
+# Cross-process print lock for parallel workers. ``None`` in the parent and
+# in sequential runs — only set in pool workers via :func:`_pool_initializer`
+# below. When set, every Logger emit serializes its single ``write() + flush()``
+# under this lock so concurrent workers don't tear each other's lines apart.
+# (Plain ``print()`` does two writes — payload and newline — and on Windows
+# with multiple processes inheriting the same stdout handle, those writes can
+# interleave at the byte level. The visible symptom was raw ``\\r\\n`` bytes
+# mid-line, rendered as ``♪◙`` by CP437-savvy terminals.)
+_print_lock = None
+
+
+def _pool_initializer(lock) -> None:
+    """Runs once per worker process at pool start-up. Stashes the shared
+    lock in the module-level slot so every Logger instance in this worker
+    serializes its writes through it."""
+    global _print_lock
+    _print_lock = lock
+
+
+def _write_line(stream: str, line: str) -> None:
+    """Single ``write()+flush()`` (under the shared lock if pooled). One
+    syscall per line is the smallest interleave-resistant unit available
+    without buffering; the lock is the extra guard for the multi-worker case.
+    """
+    target = sys.stderr if stream == "stderr" else sys.stdout
+    if _print_lock is not None:
+        with _print_lock:
+            target.write(line + "\n")
+            target.flush()
+    else:
+        target.write(line + "\n")
+        target.flush()
+
+
 class Logger:
-    def __init__(self, verbose: bool) -> None:
+    """Per-tag log emitter.
+
+    ``tag`` (when set) is prepended to every line as ``[{tag}] `` so output
+    from concurrently-extracting workers stays attributable. Writes happen
+    immediately — no buffering — so users see progress as it streams. In
+    pooled mode the writes are serialized via ``_print_lock``.
+    """
+
+    def __init__(self, verbose: bool, *, tag: str | None = None) -> None:
         self._verbose = verbose
+        self._tag = tag
+
+    def _emit(self, stream: str, message: str) -> None:
+        line = f"[{self._tag}] {message}" if self._tag else message
+        _write_line(stream, line)
 
     def info(self, message: str) -> None:
-        print(message)
+        self._emit("stdout", message)
 
     def debug(self, message: str) -> None:
         if self._verbose:
-            print(message)
+            self._emit("stdout", message)
 
     def warn(self, message: str) -> None:
-        print(f"WARNING: {message}", file=sys.stderr)
+        self._emit("stderr", f"WARNING: {message}")
+
+
+def _extract_for_tag_pooled(
+    config: ExtractConfig, tag: str, makeinfo_cmd: list[str]
+) -> bool:
+    """Worker entry point for ``--jobs > 1`` extraction.
+
+    The worker writes its log lines directly (under the shared lock set up
+    in :func:`_pool_initializer`) so users see streaming progress. Returns
+    ``True`` on success, ``False`` after warning about the failure — the
+    parent only needs the boolean to track failures.
+    """
+    logger = Logger(config.verbose, tag=tag)
+    try:
+        _extract_for_tag(config, tag, makeinfo_cmd, logger)
+        return True
+    except ExtractionError as exc:
+        logger.warn(f"Extraction failed: {exc}")
+        return False
+    except Exception as exc:  # noqa: BLE001 — surface every failure mode
+        logger.warn(f"Worker crashed: {type(exc).__name__}: {exc}")
+        return False
 
 
 class ExtractionError(Exception):
@@ -208,15 +279,36 @@ def _staged_doc(repo: Path, tag: str, version: str, fallback_root: Path | None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _load_xml(doc_root: Path, filename: str, makeinfo_cmd: list[str], logger: Logger) -> ET.Element | None:
+def _load_xml(
+    doc_root: Path,
+    filename: str,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+    cache: dict[str, ET.Element | None] | None = None,
+) -> ET.Element | None:
+    """Render ``doc/<filename>`` via ``makeinfo --xml`` and return the root.
+
+    A ``cache`` dict (per-tag) memoizes results so the same ``.texi`` file
+    isn't re-rendered when multiple extraction steps consume it (e.g.
+    ``codecs.texi`` is read for both ``codecs`` and ``codec_options``;
+    ``muxers.texi`` / ``demuxers.texi`` are each read twice as well). The
+    cache stores ``None`` for missing/unparseable sources so a second
+    lookup doesn't re-emit the warning.
+    """
+    if cache is not None and filename in cache:
+        return cache[filename]
     src = doc_root / "doc" / filename
     if not src.exists():
-        return None
-    try:
-        return run_makeinfo(src, cwd=src.parent, cmd=makeinfo_cmd)
-    except MakeinfoError as exc:
-        logger.warn(f"makeinfo failed on {filename}: {exc}")
-        return None
+        result: ET.Element | None = None
+    else:
+        try:
+            result = run_makeinfo(src, cwd=src.parent, cmd=makeinfo_cmd)
+        except MakeinfoError as exc:
+            logger.warn(f"makeinfo failed on {filename}: {exc}")
+            result = None
+    if cache is not None:
+        cache[filename] = result
+    return result
 
 
 def _load_text(repo: Path, tag: str, path: str, fallback_root: Path | None) -> str | None:
@@ -231,9 +323,14 @@ def _load_text(repo: Path, tag: str, path: str, fallback_root: Path | None) -> s
     return None
 
 
-def _extract_options(doc_root: Path, makeinfo_cmd: list[str], logger: Logger) -> list[dict]:
+def _extract_options(
+    doc_root: Path,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+    xml_cache: dict[str, ET.Element | None],
+) -> list[dict]:
     for source in ("ffmpeg.texi", "ffmpeg-all.texi", "ffmpeg-opt.texi"):
-        root = _load_xml(doc_root, source, makeinfo_cmd, logger)
+        root = _load_xml(doc_root, source, makeinfo_cmd, logger, xml_cache)
         if root is None:
             continue
         logger.debug(f"Parsing options from {source}")
@@ -264,8 +361,9 @@ def _extract_codecs(
     makeinfo_cmd: list[str],
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
+    xml_cache: dict[str, ET.Element | None],
 ) -> list[dict]:
-    root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger)
+    root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger, xml_cache)
     codecs_from_doc = dedupe_codecs(parse_codecs_xml(root)) if root is not None else []
 
     codec_flags: dict[str, dict[str, bool]] = {}
@@ -327,11 +425,11 @@ def _extract_codecs(
 
     encoder_options: dict[str, list[AVOptionEntry]] = {}
     decoder_options: dict[str, list[AVOptionEntry]] = {}
-    enc_root = _load_xml(doc_root, "encoders.texi", makeinfo_cmd, logger)
+    enc_root = _load_xml(doc_root, "encoders.texi", makeinfo_cmd, logger, xml_cache)
     if enc_root is not None:
         logger.debug("Parsing per-codec encoder options from encoders.texi")
         encoder_options = parse_per_codec_options_xml(enc_root, "encoder", known_names)
-    dec_root = _load_xml(doc_root, "decoders.texi", makeinfo_cmd, logger)
+    dec_root = _load_xml(doc_root, "decoders.texi", makeinfo_cmd, logger, xml_cache)
     if dec_root is not None:
         logger.debug("Parsing per-codec decoder options from decoders.texi")
         decoder_options = parse_per_codec_options_xml(dec_root, "decoder", known_names)
@@ -385,6 +483,7 @@ def _extract_codec_options(
     makeinfo_cmd: list[str],
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
+    xml_cache: dict[str, ET.Element | None],
 ) -> list[dict]:
     """Parse the generic AVCodec options chapter from ``codecs.texi``.
 
@@ -392,7 +491,7 @@ def _extract_codec_options(
     not carry the chapter, and we don't want to fail extraction over it.
     The SPA tolerates an absent ``codec_options`` array.
     """
-    root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger)
+    root = _load_xml(doc_root, "codecs.texi", makeinfo_cmd, logger, xml_cache)
     if root is None:
         logger.debug("codecs.texi not found; codec_options will be empty")
         return []
@@ -410,6 +509,7 @@ def _attach_per_format_options(
     makeinfo_cmd: list[str],
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
+    xml_cache: dict[str, ET.Element | None],
 ) -> None:
     """Enrich a list of muxer/demuxer dicts in place with an ``options`` field
     sourced from ``muxers.texi`` / ``demuxers.texi``.
@@ -424,7 +524,7 @@ def _attach_per_format_options(
             known.add(alias)
 
     by_name: dict[str, list[AVOptionEntry]] = {}
-    root = _load_xml(doc_root, source_file, makeinfo_cmd, logger)
+    root = _load_xml(doc_root, source_file, makeinfo_cmd, logger, xml_cache)
     if root is not None:
         logger.debug(f"Parsing per-{side} options from {source_file}")
         by_name = parse_per_format_options_xml(root, side, known)
@@ -447,9 +547,10 @@ def _extract_format_options(
     makeinfo_cmd: list[str],
     logger: Logger,
     c_map: dict[str, list[ParsedOption]],
+    xml_cache: dict[str, ET.Element | None],
 ) -> list[dict]:
     """Parse the generic AVFormat options chapter from ``formats.texi``."""
-    root = _load_xml(doc_root, "formats.texi", makeinfo_cmd, logger)
+    root = _load_xml(doc_root, "formats.texi", makeinfo_cmd, logger, xml_cache)
     if root is None:
         logger.debug("formats.texi not found; format_options will be empty")
         return []
@@ -459,8 +560,13 @@ def _extract_format_options(
     return [_av_option_to_dict(o) for o in options]
 
 
-def _extract_filters(doc_root: Path, makeinfo_cmd: list[str], logger: Logger) -> list[dict]:
-    root = _load_xml(doc_root, "filters.texi", makeinfo_cmd, logger)
+def _extract_filters(
+    doc_root: Path,
+    makeinfo_cmd: list[str],
+    logger: Logger,
+    xml_cache: dict[str, ET.Element | None],
+) -> list[dict]:
+    root = _load_xml(doc_root, "filters.texi", makeinfo_cmd, logger, xml_cache)
     if root is None:
         raise ExtractionError("Filter sources not found")
     logger.debug("Parsing filters from filters.texi")
@@ -485,6 +591,7 @@ def _extract_named(
     category: str,
     makeinfo_cmd: list[str],
     logger: Logger,
+    xml_cache: dict[str, ET.Element | None],
 ) -> list[dict]:
     """Run ``parser`` against ``doc_root/doc/<source_file>`` and serialize.
 
@@ -492,7 +599,7 @@ def _extract_named(
     single unavailable catalog doesn't fail the whole extraction. Hard
     parse/makeinfo failures still surface as warnings via ``_load_xml``.
     """
-    root = _load_xml(doc_root, source_file, makeinfo_cmd, logger)
+    root = _load_xml(doc_root, source_file, makeinfo_cmd, logger, xml_cache)
     if root is None:
         logger.warn(f"{category} source not found ({source_file})")
         return []
@@ -592,45 +699,58 @@ def _extract_and_write(
         else:
             logger.debug("No AVOption tables parsed from libav* sources")
 
+        # Memoize ``makeinfo --xml`` output per filename for this tag —
+        # several .texi files are parsed twice (codecs.texi for codecs +
+        # codec_options; muxers.texi / demuxers.texi each for the catalog
+        # and the per-entity options pass) and re-running ``makeinfo`` is
+        # the bulk of per-tag wall time. ``None`` is cached too so a
+        # repeated lookup doesn't re-emit the makeinfo-failed warning.
+        xml_cache: dict[str, ET.Element | None] = {}
+
         if "options" in config.categories:
-            options = _extract_options(doc_root, makeinfo_cmd, logger)
+            options = _extract_options(doc_root, makeinfo_cmd, logger, xml_cache)
             _write_json(output_dir / "options.json", {"options": options})
 
         if "codecs" in config.categories:
             codecs = _extract_codecs(
-                doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger, c_map,
+                doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger,
+                c_map, xml_cache,
             )
-            codec_options = _extract_codec_options(doc_root, makeinfo_cmd, logger, c_map)
+            codec_options = _extract_codec_options(
+                doc_root, makeinfo_cmd, logger, c_map, xml_cache,
+            )
             _write_json(
                 output_dir / "codecs.json",
                 {"codec_options": codec_options, "codecs": codecs},
             )
 
         if "filters" in config.categories:
-            filters = _extract_filters(doc_root, makeinfo_cmd, logger)
+            filters = _extract_filters(doc_root, makeinfo_cmd, logger, xml_cache)
             _write_json(output_dir / "filters.json", {"filters": filters})
 
         if "demuxers" in config.categories:
             demuxers = _extract_named(
                 doc_root, "demuxers.texi", parse_demuxers_xml, "demuxers",
-                makeinfo_cmd, logger,
+                makeinfo_cmd, logger, xml_cache,
             )
             _attach_per_format_options(
                 demuxers, doc_root, "demuxers.texi", "demuxer",
-                makeinfo_cmd, logger, c_map,
+                makeinfo_cmd, logger, c_map, xml_cache,
             )
             _write_json(output_dir / "demuxers.json", {"demuxers": demuxers})
 
         if "muxers" in config.categories:
             muxers = _extract_named(
                 doc_root, "muxers.texi", parse_muxers_xml, "muxers",
-                makeinfo_cmd, logger,
+                makeinfo_cmd, logger, xml_cache,
             )
             _attach_per_format_options(
                 muxers, doc_root, "muxers.texi", "muxer",
-                makeinfo_cmd, logger, c_map,
+                makeinfo_cmd, logger, c_map, xml_cache,
             )
-            format_options = _extract_format_options(doc_root, makeinfo_cmd, logger, c_map)
+            format_options = _extract_format_options(
+                doc_root, makeinfo_cmd, logger, c_map, xml_cache,
+            )
             _write_json(
                 output_dir / "muxers.json",
                 {"format_options": format_options, "muxers": muxers},
@@ -639,14 +759,14 @@ def _extract_and_write(
         if "protocols" in config.categories:
             protocols = _extract_named(
                 doc_root, "protocols.texi", parse_protocols_xml, "protocols",
-                makeinfo_cmd, logger,
+                makeinfo_cmd, logger, xml_cache,
             )
             _write_json(output_dir / "protocols.json", {"protocols": protocols})
 
         if "bitstream_filters" in config.categories:
             bsfs = _extract_named(
                 doc_root, "bitstream_filters.texi", parse_bitstream_filters_xml,
-                "bitstream_filters", makeinfo_cmd, logger,
+                "bitstream_filters", makeinfo_cmd, logger, xml_cache,
             )
             _write_json(
                 output_dir / "bitstream_filters.json",
@@ -735,15 +855,65 @@ def run_extraction(config: ExtractConfig) -> int:
         return 2
 
     failures: list[str] = []
+    worker_count = max(1, min(config.jobs, len(tags)))
 
-    for tag in tags:
-        try:
-            _extract_for_tag(config, tag, makeinfo_cmd, logger)
-        except ExtractionError as exc:
-            logger.warn(f"Extraction failed for {tag}: {exc}")
-            failures.append(tag)
-            if not config.continue_on_error:
-                return 3
+    if worker_count <= 1:
+        for tag in tags:
+            tag_logger = Logger(config.verbose, tag=tag)
+            try:
+                _extract_for_tag(config, tag, makeinfo_cmd, tag_logger)
+            except ExtractionError as exc:
+                tag_logger.warn(f"Extraction failed: {exc}")
+                failures.append(tag)
+                if not config.continue_on_error:
+                    return 3
+    else:
+        logger.debug(f"Extracting {len(tags)} tags with {worker_count} workers")
+        # ProcessPool, not ThreadPool: per-tag work is dominated by external
+        # ``makeinfo`` invocations (already separate processes) plus Python
+        # parsing of the resulting XML and the libav* C source — the latter
+        # is CPU-bound and would contend on the GIL with threads. Each
+        # worker gets its own tempdir per tag, so file-system isolation is
+        # already in place.
+        #
+        # Each worker prints its log lines directly (streaming, no buffering)
+        # under a shared lock installed by ``_pool_initializer`` — that's how
+        # we keep concurrent stdout writes from interleaving at the byte level
+        # while still letting users watch progress.
+        #
+        # We don't pre-flight ``--continue-on-error: False``: with multiple
+        # tags already in flight, "bail at first error" can't unwind the
+        # in-flight work. Instead, we let all submitted futures finish and
+        # then return non-zero — same exit code as before, slightly more
+        # work done than necessary in the failure case.
+        mp_ctx = multiprocessing.get_context()
+        print_lock = mp_ctx.Lock()
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp_ctx,
+            initializer=_pool_initializer,
+            initargs=(print_lock,),
+        ) as pool:
+            future_to_tag = {
+                pool.submit(_extract_for_tag_pooled, config, tag, makeinfo_cmd): tag
+                for tag in tags
+            }
+            for future in concurrent.futures.as_completed(future_to_tag):
+                tag = future_to_tag[future]
+                try:
+                    ok = future.result()
+                except Exception as exc:
+                    # The worker function itself failed to *return* — segfault,
+                    # pickle error, OOM. No log surfaces; report the crash and
+                    # move on. Use ``info``-style write so the line carries the
+                    # ``[{tag}]`` prefix like the rest.
+                    logger.warn(
+                        f"[{tag}] Worker died: {type(exc).__name__}: {exc}"
+                    )
+                    failures.append(tag)
+                    continue
+                if not ok:
+                    failures.append(tag)
 
     if failures:
         logger.warn(f"Extraction failed for tags: {', '.join(failures)}")
