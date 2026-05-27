@@ -18,6 +18,8 @@ env:
   FFMPEG_REPO: https://github.com/FFmpeg/FFmpeg.git
   FFMPEG_SRC_DIR: ${{ github.workspace }}/.ffmpeg-src
   EXTRACTOR_RANGE: n3.4.0..n9999.9999.9999
+  X264_REPO: https://code.videolan.org/videolan/x264.git
+  X264_SRC_DIR: ${{ github.workspace }}/.x264-src
 
 jobs:
   build:
@@ -72,10 +74,33 @@ jobs:
           fi
           echo "Tag count: $(git -C "${FFMPEG_SRC_DIR}" tag | wc -l)"
 
+      - name: Restore x264 git clone cache
+        id: x264-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.X264_SRC_DIR }}
+          key: x264-git-${{ github.run_id }}
+          restore-keys: |
+            x264-git-
+
+      - name: Clone or update x264 sources
+        run: |
+          set -euo pipefail
+          if [ -d "${X264_SRC_DIR}/.git" ]; then
+            echo "Updating existing x264 clone…"
+            git -C "${X264_SRC_DIR}" remote set-url origin "${X264_REPO}"
+            git -C "${X264_SRC_DIR}" fetch --prune --tags --force origin
+          else
+            echo "Cloning x264 from ${X264_REPO}…"
+            rm -rf "${X264_SRC_DIR}"
+            git clone --no-checkout "${X264_REPO}" "${X264_SRC_DIR}"
+          fi
+
       - name: Extract FFmpeg metadata + documentation
         run: |
           ffmpeg-metadata-extract \
             --repo "${FFMPEG_SRC_DIR}" \
+            --x264-repo "${X264_SRC_DIR}" \
             --out web/public \
             --range "${EXTRACTOR_RANGE}" \
             --latest-per-minor \
