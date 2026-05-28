@@ -187,6 +187,57 @@ _PAGE_STYLE = """
 """
 
 
+def build_generated_doc_footer(
+    *,
+    project_title: str,
+    snapshot_label: str,
+    source_url: str,
+    license_name: str,
+    license_href: str,
+    notices_href: str,
+    copyright_line: str,
+    commercial_notice: str = "",
+) -> str:
+    """Return a ``<footer>`` block stating that a rendered reference page is
+    *generated documentation* derived from a GPL/LGPL upstream — naming the
+    license, linking the bundled license text, the corresponding upstream
+    source, and the aggregate third-party notices.
+
+    Shared by the x264/x265 renderer (:func:`render_help_doc`) and the
+    FFmpeg ``ffmpeg-all.html`` post-processor so every distributed page that
+    derives from a copyleft source carries the same attribution. Styling is
+    inline because the FFmpeg page (rendered by ``t2h.pm``) does not share the
+    x264/x265 page's ``<style>`` block.
+    """
+    lines = [
+        '<footer class="thirdparty-notice" style="max-width:1100px;margin:2.5rem auto 1.5rem;'
+        'padding:1rem 1.5rem;border-top:1px solid #ddd;font-size:0.85rem;'
+        'line-height:1.5;color:#555;">',
+        f"  <p>This page is <strong>generated documentation</strong> derived from "
+        f"{html.escape(project_title)} ({html.escape(snapshot_label)}); it is not the "
+        f"original source.</p>",
+        f"  <p>{html.escape(project_title)} is {html.escape(copyright_line)}, "
+        f"licensed under {html.escape(license_name)}.",
+    ]
+    if commercial_notice:
+        lines.append(f"  {html.escape(commercial_notice)}")
+    lines.append("  </p>")
+    links: list[str] = []
+    if license_href:
+        links.append(f'<a href="{html.escape(license_href)}">Full license text</a>')
+    if source_url:
+        links.append(
+            f'Corresponding source: <a href="{html.escape(source_url)}" '
+            f'rel="noreferrer">{html.escape(source_url)}</a>'
+        )
+    if notices_href:
+        links.append(f'<a href="{html.escape(notices_href)}">All third-party notices</a>')
+    if links:
+        lines.append("  <p>" + " · ".join(links) + "</p>")
+    lines.append("</footer>\n")
+    return "\n".join(lines)
+
+
 def render_help_doc(
     doc: HelpDoc,
     *,
@@ -194,6 +245,11 @@ def render_help_doc(
     identifier: str = "",
     identifier_kind: str = "commit",
     source_url: str = "",
+    license_name: str = "",
+    license_href: str = "",
+    notices_href: str = "",
+    copyright_line: str = "",
+    commercial_notice: str = "",
 ) -> str:
     """Return one self-contained HTML page for ``doc``.
 
@@ -202,6 +258,12 @@ def render_help_doc(
     the snapshot identity (a commit SHA or release tag); ``identifier_kind``
     labels it (``"commit"`` / ``"tag"``). ``source_url`` points at the
     upstream repository. All but ``project`` are optional.
+
+    The ``license_*`` / ``copyright_line`` / ``commercial_notice`` arguments
+    drive a GPL/LGPL attribution footer (see
+    :func:`build_generated_doc_footer`); when ``license_name`` is empty the
+    footer is omitted (keeps the renderer usable in tests without license
+    plumbing).
     """
     short_id = identifier
     if identifier_kind == "commit" and identifier:
@@ -225,6 +287,20 @@ def render_help_doc(
     meta = " · ".join(meta_parts)
 
     sections_html = "\n".join(_render_section(s) for s in doc.sections)
+
+    footer_html = ""
+    if license_name:
+        snapshot_label = f"{identifier_kind} {short_id}" if short_id else "unspecified snapshot"
+        footer_html = build_generated_doc_footer(
+            project_title=project,
+            snapshot_label=snapshot_label,
+            source_url=source_url,
+            license_name=license_name,
+            license_href=license_href,
+            notices_href=notices_href,
+            copyright_line=copyright_line,
+            commercial_notice=commercial_notice,
+        )
 
     return (
         "<!doctype html>\n"
@@ -253,6 +329,7 @@ def render_help_doc(
         + "\n    </div>\n"
         "  </div>\n"
         "</main>\n"
-        "</body>\n"
+        + footer_html
+        + "</body>\n"
         "</html>\n"
     )

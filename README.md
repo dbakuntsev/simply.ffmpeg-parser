@@ -107,4 +107,11 @@ resolver under `web/src/parser/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The source in this repository is MIT — see [LICENSE](LICENSE).
+
+The metadata bundles and HTML reference pages the deployed app serves are
+*derivative works* of FFmpeg (LGPL v2.1+), x264 (GPL v2+) and x265 (GPL v2+),
+distributed under those licenses rather than MIT. They are generated at build
+time and never committed. See
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for the full breakdown and
+how attribution is bundled into the deploy.

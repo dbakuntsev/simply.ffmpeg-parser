@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import html
 import json
 import multiprocessing
 import os
@@ -33,7 +34,12 @@ from .git_utils import (
     temporary_worktree,
 )
 from .models import AVOptionEntry, ExtractConfig
-from .upstream_help import HelpDoc, UpstreamOptionHelp, render_help_doc
+from .upstream_help import (
+    HelpDoc,
+    UpstreamOptionHelp,
+    build_generated_doc_footer,
+    render_help_doc,
+)
 from .x264_help import parse_x264_doc
 from .x265_help import parse_x265_doc
 
@@ -95,6 +101,59 @@ _T2H_HREF_REPOINTS = (
 # (``None`` = confirmed absent). Pool workers are separate processes, so each
 # shells out to ``git show`` at most once per asset.
 _pinned_asset_cache: dict[str, bytes | None] = {}
+
+# --- Third-party license / attribution -------------------------------------
+#
+# The distributed artifacts (per-version JSON, the FFmpeg ``ffmpeg-all.html``
+# reference, and the x264/x265 reference pages) are derivative works of GPL /
+# LGPL upstreams, so the deploy must carry each upstream's license text, a
+# copyright notice, and a pointer to the corresponding source. We fetch the
+# verbatim ``COPYING`` file from each repo at build time into ``<out>/licenses``
+# (never vendored — keeps this repo's tree 100% MIT) and emit one aggregate
+# ``THIRD-PARTY-NOTICES.html`` at the output root.
+#
+# FFmpeg is consumed only via its documentation + ``libav*`` headers (none of
+# the GPL-only files), so the LGPL v2.1 text is the governing license; x264 and
+# x265 both ship the GPL v2 text as ``COPYING`` and are "v2 or later".
+_FFMPEG_LICENSE_SRC = "COPYING.LGPLv2.1"
+_UPSTREAM_LICENSE_SRC = "COPYING"
+
+# Relative prefix from a rendered doc page (always 3 levels deep:
+# ``doc/ffmpeg/<ver>/``, ``doc/x264/<id>/``, ``doc/x265/<id>/``) back to the
+# output root, where ``licenses/`` and ``THIRD-PARTY-NOTICES.html`` live.
+_DOC_TO_ROOT = "../../.."
+_NOTICES_FILENAME = "THIRD-PARTY-NOTICES.html"
+
+# Static descriptor for each upstream, keyed by the slug used in output paths.
+# ``license_file`` is the name written under ``<out>/licenses/``.
+_THIRD_PARTY = {
+    "ffmpeg": {
+        "title": "FFmpeg",
+        "license": "GNU LGPL v2.1 or later",
+        "license_file": "LICENSE_FFMPEG.txt",
+        "copyright": "Copyright (c) the FFmpeg developers",
+        "source_url": "https://github.com/FFmpeg/FFmpeg",
+        "derived_from": "the FFmpeg documentation and libav* headers",
+    },
+    "x264": {
+        "title": "x264",
+        "license": "GNU GPL v2 or later",
+        "license_file": "LICENSE_X264.txt",
+        "copyright": "Copyright (c) the x264 project",
+        "source_url": "https://code.videolan.org/videolan/x264",
+        "derived_from": "the x264 command-line help text and source",
+    },
+    "x265": {
+        "title": "x265",
+        "license": "GNU GPL v2 or later",
+        "license_file": "LICENSE_X265.txt",
+        "copyright": "Copyright (c) MulticoreWare, Inc. and contributors",
+        "source_url": "https://bitbucket.org/multicoreware/x265_git",
+        "derived_from": "the x265 command-line help text and source",
+        "commercial": "x265 is also available under a commercial license; "
+        "contact license@x265.com.",
+    },
+}
 
 
 def _pinned_asset_bytes(repo: Path, path: str) -> bytes | None:
@@ -1005,7 +1064,11 @@ def _extract_and_write(
                                 project="x264",
                                 identifier=commit[:12],
                                 identifier_kind="commit",
-                                source_url="https://code.videolan.org/videolan/x264",
+                                source_url=_THIRD_PARTY["x264"]["source_url"],
+                                license_name=_THIRD_PARTY["x264"]["license"],
+                                license_href=f"{_DOC_TO_ROOT}/licenses/{_THIRD_PARTY['x264']['license_file']}",
+                                notices_href=f"{_DOC_TO_ROOT}/{_NOTICES_FILENAME}",
+                                copyright_line=_THIRD_PARTY["x264"]["copyright"],
                             )
                             x264_doc_path = _emit_upstream_doc(
                                 config.out, config.repo, "x264", commit[:12],
@@ -1072,7 +1135,12 @@ def _extract_and_write(
                             project="x265",
                             identifier=x265_tag,
                             identifier_kind="tag",
-                            source_url="https://bitbucket.org/multicoreware/x265_git",
+                            source_url=_THIRD_PARTY["x265"]["source_url"],
+                            license_name=_THIRD_PARTY["x265"]["license"],
+                            license_href=f"{_DOC_TO_ROOT}/licenses/{_THIRD_PARTY['x265']['license_file']}",
+                            notices_href=f"{_DOC_TO_ROOT}/{_NOTICES_FILENAME}",
+                            copyright_line=_THIRD_PARTY["x265"]["copyright"],
+                            commercial_notice=_THIRD_PARTY["x265"]["commercial"],
                         )
                         x265_doc_path = _emit_upstream_doc(
                             config.out, config.repo, "x265", x265_tag,
@@ -1152,7 +1220,7 @@ def _extract_and_write(
 
         if config.html_doc:
             _generate_html_doc(
-                doc_root, config.out, config.repo, target_version,
+                doc_root, config.out, config.repo, target_version, tag,
                 makeinfo_cmd, logger,
             )
 
@@ -1168,6 +1236,7 @@ def _generate_html_doc(
     out: Path,
     repo: Path,
     target_version: str,
+    tag: str,
     makeinfo_cmd: list[str],
     logger: Logger,
 ) -> None:
@@ -1221,6 +1290,45 @@ def _generate_html_doc(
         )
     except MakeinfoError as exc:
         logger.warn(f"HTML doc generation failed for {target_version}: {exc}")
+        return
+
+    _inject_ffmpeg_doc_footer(output_path, tag, logger)
+
+
+def _inject_ffmpeg_doc_footer(output_path: Path, tag: str, logger: Logger) -> None:
+    """Append the LGPL attribution footer to a rendered ``ffmpeg-all.html``.
+
+    The page is produced by ``t2h.pm`` (makeinfo), not by our renderer, so the
+    footer is spliced in by post-processing: inserted before the final
+    ``</body>`` so it lands at the bottom of the document. A page missing
+    ``</body>`` (unexpected) gets the footer appended and a warning.
+    """
+    info = _THIRD_PARTY["ffmpeg"]
+    footer = build_generated_doc_footer(
+        project_title=info["title"],
+        snapshot_label=f"tag {tag}",
+        source_url=info["source_url"],
+        license_name=info["license"],
+        license_href=f"{_DOC_TO_ROOT}/licenses/{info['license_file']}",
+        notices_href=f"{_DOC_TO_ROOT}/{_NOTICES_FILENAME}",
+        copyright_line=info["copyright"],
+    )
+    try:
+        text = output_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warn(f"Could not read {output_path} to add license footer: {exc}")
+        return
+
+    marker = "</body>"
+    idx = text.rfind(marker)
+    if idx == -1:
+        logger.warn(
+            f"No </body> in {output_path}; appending license footer at end of file"
+        )
+        text = text + "\n" + footer
+    else:
+        text = text[:idx] + footer + text[idx:]
+    output_path.write_text(text, encoding="utf-8")
 
 
 def _ensure_shared_assets(doc_root_out: Path, repo: Path, logger: Logger) -> bool:
@@ -1303,6 +1411,156 @@ def _emit_upstream_doc(
         _upstream_emit_cache.add(key)
         logger.debug(f"Rendered {project} reference -> {relative}")
     return relative
+
+
+def _ensure_license_texts(config: ExtractConfig, logger: Logger) -> None:
+    """Fetch each upstream's verbatim license text into ``<out>/licenses/``.
+
+    FFmpeg's ``COPYING.LGPLv2.1`` comes from :data:`_PINNED_ASSET_TAG` (the
+    text is invariant across the tag range, so one fetch covers every emitted
+    version); x264 / x265 ship the GPL v2 text as ``COPYING`` and are fetched
+    from ``HEAD`` of their respective clones (also invariant). Best-effort:
+    a missing file is warned and skipped — the page footers/notices still
+    reference it, but the deploy is then incomplete and the warning is loud.
+    """
+    out_dir = config.out / "licenses"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    specs: list[tuple[Path, str, str, str]] = [
+        (config.repo, _PINNED_ASSET_TAG, _FFMPEG_LICENSE_SRC, _THIRD_PARTY["ffmpeg"]["license_file"]),
+    ]
+    if config.x264_repo is not None:
+        specs.append(
+            (config.x264_repo, "HEAD", _UPSTREAM_LICENSE_SRC, _THIRD_PARTY["x264"]["license_file"])
+        )
+    if config.x265_repo is not None:
+        specs.append(
+            (config.x265_repo, "HEAD", _UPSTREAM_LICENSE_SRC, _THIRD_PARTY["x265"]["license_file"])
+        )
+
+    for repo, ref, src, name in specs:
+        data = show_file_bytes(repo, ref, src)
+        if data is None:
+            logger.warn(
+                f"License text {ref}:{src} not found in {repo}; "
+                f"licenses/{name} not written (deploy attribution incomplete)"
+            )
+            continue
+        dst = out_dir / name
+        tmp = dst.with_name(f"{name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dst)
+        logger.debug(f"Wrote third-party license text -> {dst}")
+
+
+def _version_sort_key(name: str) -> tuple:
+    """Sort ``major.minor`` version dir names numerically; fall back to the
+    raw string for anything non-numeric so the sort never raises."""
+    parts = name.split(".")
+    if all(p.isdigit() for p in parts):
+        return (0, tuple(int(p) for p in parts))
+    return (1, name)
+
+
+def _generate_notices_page(config: ExtractConfig, logger: Logger) -> None:
+    """Emit ``<out>/THIRD-PARTY-NOTICES.html`` listing every upstream the
+    deploy redistributes derived artifacts from, the governing license, the
+    bundled license text, and the exact snapshots that were emitted.
+
+    Runs once in the parent after the per-tag loop. The set of snapshots is
+    read back off the output tree (process-pool-safe — no need to thread data
+    out of workers): FFmpeg versions from ``metadata/ffmpeg/<ver>/`` and the
+    x264/x265 commits/tags from ``doc/<project>/<id>/``.
+    """
+    out = config.out
+
+    def _subdir_names(base: Path) -> list[str]:
+        if not base.is_dir():
+            return []
+        return [c.name for c in base.iterdir() if c.is_dir()]
+
+    ffmpeg_versions = sorted(
+        _subdir_names(out / "metadata" / "ffmpeg"), key=_version_sort_key
+    )
+    snapshots = {
+        "ffmpeg": ffmpeg_versions,
+        "x264": sorted(_subdir_names(out / "doc" / "x264")),
+        "x265": sorted(_subdir_names(out / "doc" / "x265")),
+    }
+    license_dir = out / "licenses"
+
+    sections: list[str] = []
+    for slug, info in _THIRD_PARTY.items():
+        ids = snapshots.get(slug, [])
+        if slug != "ffmpeg" and not ids:
+            # x264/x265 weren't part of this run — omit the section entirely.
+            continue
+        license_file = info["license_file"]
+        has_text = (license_dir / license_file).is_file()
+        license_link = (
+            f'<a href="licenses/{html.escape(license_file)}">{html.escape(info["license"])}</a>'
+            if has_text
+            else html.escape(info["license"])
+        )
+        parts = [
+            f'  <section class="tp">',
+            f'    <h2>{html.escape(info["title"])}</h2>',
+            f'    <p>{html.escape(info["copyright"])}</p>',
+            f'    <p>Licensed under {license_link}.',
+        ]
+        if info.get("commercial"):
+            parts.append(f'    {html.escape(info["commercial"])}')
+        parts.append("    </p>")
+        parts.append(
+            f'    <p>The bundles and reference pages here are generated from '
+            f'{html.escape(info["derived_from"])}; they are not the original source. '
+            f'Corresponding source: '
+            f'<a href="{html.escape(info["source_url"])}" rel="noreferrer">'
+            f'{html.escape(info["source_url"])}</a>.</p>'
+        )
+        if ids:
+            label = "Versions" if slug == "ffmpeg" else (
+                "Commits" if slug == "x264" else "Tags"
+            )
+            shown = ", ".join(html.escape(i) for i in ids)
+            parts.append(
+                f'    <p class="tp-snaps">{label} included: {shown}</p>'
+            )
+        parts.append("  </section>")
+        sections.append("\n".join(parts))
+
+    page = (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '  <meta charset="utf-8">\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "  <title>Third-party licenses &amp; attribution</title>\n"
+        "  <style>\n"
+        "    body { font-family: system-ui, sans-serif; max-width: 820px; margin: 0 auto;\n"
+        "           padding: 2rem 1.5rem; color: #24292e; line-height: 1.55; }\n"
+        "    h1 { font-size: 1.6rem; } h2 { font-size: 1.2rem; margin-top: 0; }\n"
+        "    .tp { border: 1px solid #e1e4e8; border-radius: 6px; padding: 1rem 1.25rem;\n"
+        "          margin-bottom: 1.25rem; }\n"
+        "    .tp-snaps { color: #666; font-size: 0.85rem; }\n"
+        "    a { color: #0366d6; }\n"
+        "    .intro { color: #444; }\n"
+        "  </style>\n"
+        "</head>\n"
+        "<body>\n"
+        "  <h1>Third-party licenses &amp; attribution</h1>\n"
+        '  <p class="intro">Simply FFmpeg Parser is MIT-licensed. The per-version metadata\n'
+        "  bundles and the rendered HTML reference pages it serves are <strong>derivative\n"
+        "  works</strong> generated from the upstream projects below and are distributed\n"
+        "  under each project's own license, not MIT. The shared <code>bootstrap.min.css</code>\n"
+        "  and <code>style.min.css</code> are MIT and carry their own notices.</p>\n"
+        + "\n".join(sections)
+        + "\n</body>\n</html>\n"
+    )
+
+    dst = out / _NOTICES_FILENAME
+    dst.write_text(page, encoding="utf-8")
+    logger.info(f"Wrote third-party notices -> {dst}")
 
 
 def run_extraction(config: ExtractConfig) -> int:
@@ -1401,6 +1659,13 @@ def run_extraction(config: ExtractConfig) -> int:
             # queued lines); stop the drain thread once it has written them.
             log_queue.put(None)
             drain_thread.join()
+
+    # Third-party license texts + aggregate notices page. Emitted once in the
+    # parent regardless of per-tag failures (any artifact that did land must
+    # still carry its attribution); the notices page reflects whatever
+    # snapshots actually made it to the output tree.
+    _ensure_license_texts(config, logger)
+    _generate_notices_page(config, logger)
 
     if failures:
         logger.warn(f"Extraction failed for tags: {', '.join(failures)}")

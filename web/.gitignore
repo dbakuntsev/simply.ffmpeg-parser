@@ -3,4 +3,6 @@ public/metadata/ffmpeg/*/
 public/doc/ffmpeg/*
 public/doc/x264/*
 public/doc/x265/*
+public/licenses/
+public/THIRD-PARTY-NOTICES.html
 .vite/

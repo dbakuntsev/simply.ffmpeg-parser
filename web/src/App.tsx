@@ -109,6 +109,12 @@ export default function App() {
       {selection && (
         <SelectionPanel selection={selection} onClose={clear} />
       )}
+
+      <footer className="mt-2 border-t border-edge pt-4 text-xs text-muted">
+        <a className="underline hover:text-ink" href={`${import.meta.env.BASE_URL}THIRD-PARTY-NOTICES.html`}>
+          Licenses &amp; attribution
+        </a>
+      </footer>
     </div>
     </div>
   );

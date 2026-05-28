@@ -128,6 +128,28 @@ Full details on the build-time fetch, the pinned tag, and the exact `t2h.pm`
 edit are documented in the in-package README:
 [`metadata-extractor/README.md`](metadata-extractor/README.md).
 
+## Third-party license attribution
+
+The JSON bundles and HTML reference pages are derivative works of FFmpeg
+(LGPL v2.1+), x264 (GPL v2+) and x265 (GPL v2+). On every run the extractor
+emits the attribution required to redistribute them:
+
+- `<out>/licenses/LICENSE_FFMPEG.txt`, `LICENSE_X264.txt`, `LICENSE_X265.txt` —
+  each upstream's verbatim license text, fetched at build time (`COPYING.LGPLv2.1`
+  from FFmpeg's pinned **n8.1.1** tag; `COPYING` from `HEAD` of the x264/x265
+  clones). Like `t2h.pm`/CSS, these are never vendored, so the repo stays MIT.
+- `<out>/THIRD-PARTY-NOTICES.html` — an aggregate notices page listing each
+  upstream, its license, copyright, the snapshots included in this run, and a
+  link to the corresponding source. Built once at the end of the run by scanning
+  the output tree.
+- A footer on every rendered reference page (`ffmpeg-all.html`,
+  `x264-reference.html`, `x265-reference.html`) marking it as generated
+  documentation and linking the bundled license text + the corresponding source
+  at the exact tag/commit.
+
+These outputs (plus the per-version directories) are gitignored. See
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for the full model.
+
 ## Running it locally
 
 ### Prerequisites
