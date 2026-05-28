@@ -91,6 +91,10 @@ export interface Issue {
 
 export interface MetadataIndex {
   version: string;
+  /** Exact upstream git tag this bundle was extracted from (e.g. `n8.1.1`).
+   * `version` is rolled up to `major.minor`; this preserves the patch.
+   * Optional — bundles produced before the extractor emitted it lack it. */
+  tag?: string;
   released: string;
   options: string;
   codecs: string;

@@ -876,6 +876,7 @@ def _build_index(
     released: str | None,
     categories: set[str],
     *,
+    tag: str = "",
     x264_doc: str = "",
     x265_doc: str = "",
 ) -> dict:
@@ -883,6 +884,12 @@ def _build_index(
         "version": version,
         "released": released or "",
     }
+    # The exact upstream git tag this bundle was extracted from (e.g.
+    # ``n8.1.1``). ``version`` is rolled up to ``major.minor`` under
+    # ``--latest-per-minor``, so the patch is only recoverable from here —
+    # the third-party notices page needs it to cite the precise source.
+    if tag:
+        index["tag"] = tag
     # Only advertise files this run actually produced. Older bundles on disk
     # carried only options/codecs/filters; the SPA must tolerate the absence
     # of the value-lookup keys, which is exactly what omitting them signals.
@@ -1226,7 +1233,7 @@ def _extract_and_write(
 
     index = _build_index(
         target_version, released, config.categories,
-        x264_doc=x264_doc_path, x265_doc=x265_doc_path,
+        tag=tag, x264_doc=x264_doc_path, x265_doc=x265_doc_path,
     )
     _write_json(output_dir / "index.json", index)
 
@@ -1479,11 +1486,23 @@ def _generate_notices_page(config: ExtractConfig, logger: Logger) -> None:
             return []
         return [c.name for c in base.iterdir() if c.is_dir()]
 
-    ffmpeg_versions = sorted(
-        _subdir_names(out / "metadata" / "ffmpeg"), key=_version_sort_key
-    )
+    # Cite the exact patch-level tag (e.g. ``n8.1.1``), not the rolled-up
+    # ``major.minor`` directory name — read it back from each version's
+    # index.json (written with a ``tag`` field by _build_index). Fall back to
+    # the directory name when the tag is absent (older bundle on disk).
+    ffmpeg_meta = out / "metadata" / "ffmpeg"
+    ffmpeg_tags: list[str] = []
+    for ver in sorted(_subdir_names(ffmpeg_meta), key=_version_sort_key):
+        tag = ""
+        index_file = ffmpeg_meta / ver / "index.json"
+        if index_file.is_file():
+            try:
+                tag = json.loads(index_file.read_text(encoding="utf-8")).get("tag", "")
+            except (OSError, ValueError):
+                tag = ""
+        ffmpeg_tags.append(tag or ver)
     snapshots = {
-        "ffmpeg": ffmpeg_versions,
+        "ffmpeg": ffmpeg_tags,
         "x264": sorted(_subdir_names(out / "doc" / "x264")),
         "x265": sorted(_subdir_names(out / "doc" / "x265")),
     }
@@ -1519,9 +1538,7 @@ def _generate_notices_page(config: ExtractConfig, logger: Logger) -> None:
             f'{html.escape(info["source_url"])}</a>.</p>'
         )
         if ids:
-            label = "Versions" if slug == "ffmpeg" else (
-                "Commits" if slug == "x264" else "Tags"
-            )
+            label = "Commits" if slug == "x264" else "Tags"
             shown = ", ".join(html.escape(i) for i in ids)
             parts.append(
                 f'    <p class="tp-snaps">{label} included: {shown}</p>'
