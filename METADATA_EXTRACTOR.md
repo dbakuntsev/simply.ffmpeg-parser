@@ -12,7 +12,7 @@ release tag, so it can be re-run for historical versions years after
 release.
 
 - Source: [`metadata-extractor/`](metadata-extractor/)
-- In-package README (vendored-asset details, refresh procedure):
+- In-package README (build-time HTML asset details, pinned tag):
   [`metadata-extractor/README.md`](metadata-extractor/README.md)
 
 ## What it extracts
@@ -106,23 +106,26 @@ page includes every option, codec, filter, format, and protocol available
 in that version.
 
 Two CSS files (`bootstrap.min.css`, `style.min.css`) and one Perl init file
-(`t2h.pm`) are **vendored** with the extractor under
-`ffmpeg_metadata_extractor/assets/`. The vendored `t2h.pm` is the
-n8.x-version-gated copy (older tags ship a `t2h.pm` that calls APIs removed
-in Texinfo 7.1+, which causes silent makeinfo failures with modern
-toolchains), with two `href` lines modified so generated pages link to the
-**shared** CSS under `<out>/doc/ffmpeg/` rather than expecting a per-version
-copy.
+(`t2h.pm`) are needed for rendering. None are committed to this repo — they
+are **fetched from `--repo` at build time** via `git show <tag>:doc/<file>`,
+pinned to FFmpeg tag **n8.1.1**. The n8.1.1 `t2h.pm` is version-gated for
+Texinfo 7.1+ (older tags ship a `t2h.pm` that calls removed APIs, causing
+silent makeinfo failures with modern toolchains); its two CSS `href` lines are
+repointed in code so generated pages link to the **shared** CSS under
+`<out>/doc/ffmpeg/` rather than a per-version copy. Fetching at build time
+(rather than vendoring) keeps the package 100% MIT — `t2h.pm` is GPLv3+ and is
+never checked in.
 
 A single shared copy of the n8.1.1 CSS styles every version correctly,
 because `bootstrap.min.css` is byte-identical from n5.1 through n8.1, and
 `style.min.css` is identical from n5.1 through n7.1 with the n8.1.1 file
 being a strict superset.
 
-Pass `--disable-html-doc` to skip the HTML render step. Full details on
-the vendored assets, why each is vendored, the exact `t2h.pm` edits, the
-refresh procedure for newer FFmpeg releases, and the `--check-assets`
-helper are documented in the in-package README:
+**`--repo` must contain the `n8.1.1` tag** for HTML rendering; if it is
+absent, HTML is skipped per version with a warning (JSON extraction is
+unaffected). Pass `--disable-html-doc` to skip the HTML render step entirely.
+Full details on the build-time fetch, the pinned tag, and the exact `t2h.pm`
+edit are documented in the in-package README:
 [`metadata-extractor/README.md`](metadata-extractor/README.md).
 
 ## Running it locally
@@ -193,7 +196,7 @@ This writes:
 
 - `web/public/metadata/ffmpeg/<version>/*.json` (one directory per kept tag)
 - `web/public/doc/ffmpeg/<version>/ffmpeg-all.html` plus the shared
-  `bootstrap.min.css`, `style.min.css`, and `t2h.pm` one level up
+  `bootstrap.min.css` and `style.min.css` one level up
 
 After running the extractor you still need to regenerate
 `web/public/metadata/ffmpeg/index.json` — the SPA's version list — using
@@ -213,7 +216,6 @@ ffmpeg-metadata-extract --repo /path/to/ffmpeg --tags n7.1.2 --out ./dist
   invalid range syntax, …)
 - `3` — extraction failed for at least one tag. Pair with
   `--continue-on-error` to collect failures instead of bailing on the first.
-- `4` — `--check-assets` reported at least one differing asset
 
 ## How it's used in the GitHub Actions deploy workflow
 

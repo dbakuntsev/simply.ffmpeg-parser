@@ -127,9 +127,9 @@ def show_file(repo: Path, tag: str, path: str) -> str | None:
 def show_file_bytes(repo: Path, tag: str, path: str) -> bytes | None:
     """Return the raw bytes of ``path`` at ``tag``, or ``None`` if not present.
 
-    Used for byte-exact comparisons (e.g. checksum/superset checks against
-    vendored binary or whitespace-sensitive assets). ``show_file`` decodes
-    via the locale and may rewrite line endings on Windows.
+    Used when bytes must be preserved exactly (e.g. fetching the pinned-tag
+    CSS / ``t2h.pm`` HTML-rendering assets). ``show_file`` decodes via the
+    locale and may rewrite line endings on Windows.
     """
     try:
         result = subprocess.run(

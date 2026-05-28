@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 
-from .asset_check import check_assets
 from .extractor import ExtractConfig, run_extraction
 
 
@@ -43,20 +42,6 @@ def main() -> int:
         description="Extract FFmpeg metadata for Simply.ffmpeg-parser",
     )
     parser.add_argument("--repo", required=True, help="Path to FFmpeg repository root")
-    parser.add_argument(
-        "--check-assets",
-        dest="check_assets",
-        nargs="?",
-        const="latest",
-        default=None,
-        metavar="TAG",
-        help=(
-            "Compare vendored CSS assets (bootstrap.min.css, style.min.css) "
-            "against an FFmpeg tag and exit. With no value, compares against "
-            "the latest n<major>.<minor>.<patch> tag in --repo. Pass a tag "
-            "(e.g. --check-assets n8.2.0) to compare against a specific one."
-        ),
-    )
     parser.add_argument("--tags", help="Comma-separated list of tags")
     parser.add_argument("--range", dest="tag_range", help="Tag range like n6.1.0..n7.1.2")
     parser.add_argument(
@@ -74,7 +59,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--out",
-        help="Output root directory (required unless --check-assets is used)",
+        required=True,
+        help="Output root directory",
     )
     parser.add_argument(
         "--categories",
@@ -142,12 +128,6 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-
-    if args.check_assets is not None:
-        return check_assets(Path(args.repo), args.check_assets)
-
-    if not args.out:
-        parser.error("--out is required (unless --check-assets is used)")
 
     tags = None
     if args.tags:

@@ -73,7 +73,7 @@ class HelpDoc:
 
 # Page lives at ``<out>/doc/<project>/<id>/<project>-reference.html``, so
 # two ``..`` segments climb to ``<out>/doc/`` and then enter ``ffmpeg/``
-# for the shared assets vendored there for the FFmpeg HTML reference.
+# for the shared CSS the FFmpeg HTML reference also uses.
 _SHARED_CSS_PREFIX = "../../ffmpeg"
 
 _NON_ANCHOR_CHARS = re.compile(r"[^A-Za-z0-9_-]+")

@@ -26,6 +26,7 @@ from .git_utils import (
     commit_at_or_before,
     list_tags,
     show_file,
+    show_file_bytes,
     tag_at_or_before,
     tag_date_iso,
     temporary_worktree,
@@ -65,9 +66,41 @@ from .texi_xml import MakeinfoError, resolve_makeinfo, run_makeinfo, run_makeinf
 
 _TAG_PATTERN = re.compile(r"^n(\d+)\.(\d+)\.(\d+)$")
 
-_ASSETS_DIR = Path(__file__).parent / "assets"
+# HTML rendering assets (t2h.pm + the two CSS files) are fetched from this
+# pinned FFmpeg tag at build time rather than vendored into the package, so no
+# GPL-licensed bytes (t2h.pm is "part of FFmpeg", GPLv3+) are committed to this
+# MIT repo — consistent with the project rule that GPL-derived artifacts are
+# generated at build time and never checked in. The tag is pinned (not "the
+# tag being rendered") because n8.1.1's t2h.pm is version-gated for Texinfo
+# 7.1+, while older tags' copies call APIs (e.g. $self->gdt) that 7.1 removed;
+# the n8.1.1 init file is the one that renders across the whole tag range.
+_PINNED_ASSET_TAG = "n8.1.1"
 _SHARED_CSS_FILES = ("bootstrap.min.css", "style.min.css")
-_VENDORED_T2H = "t2h.pm"
+_T2H_DOC_PATH = "doc/t2h.pm"
+
+# n8.1.1's doc/t2h.pm emits two stylesheet <link>s pointing at CSS sitting
+# beside the generated HTML. We repoint each one directory up so every
+# version's page under doc/ffmpeg/<version>/ shares a single CSS pair at
+# doc/ffmpeg/. This is the only modification made to the upstream file, applied
+# here in code (MIT) rather than to a committed copy. Each replacement must hit
+# exactly once; a miss means the pinned init file changed shape and the repoint
+# silently no-opped, so we skip HTML with a loud warning instead.
+_T2H_HREF_REPOINTS = (
+    ('href="bootstrap.min.css"', 'href="../bootstrap.min.css"'),
+    ('href="style.min.css"', 'href="../style.min.css"'),
+)
+
+# Per-process cache of pinned-tag asset bytes keyed by repo-relative path
+# (``None`` = confirmed absent). Pool workers are separate processes, so each
+# shells out to ``git show`` at most once per asset.
+_pinned_asset_cache: dict[str, bytes | None] = {}
+
+
+def _pinned_asset_bytes(repo: Path, path: str) -> bytes | None:
+    """Return ``path`` at :data:`_PINNED_ASSET_TAG` from ``repo``, memoized."""
+    if path not in _pinned_asset_cache:
+        _pinned_asset_cache[path] = show_file_bytes(repo, _PINNED_ASSET_TAG, path)
+    return _pinned_asset_cache[path]
 
 
 # Cross-process print lock for parallel workers. ``None`` in the parent and
@@ -944,7 +977,8 @@ def _extract_and_write(
                                 source_url="https://code.videolan.org/videolan/x264",
                             )
                             x264_doc_path = _emit_upstream_doc(
-                                config.out, "x264", commit[:12], x264_html, logger,
+                                config.out, config.repo, "x264", commit[:12],
+                                x264_html, logger,
                             )
                         else:
                             logger.warn(
@@ -1010,7 +1044,8 @@ def _extract_and_write(
                             source_url="https://bitbucket.org/multicoreware/x265_git",
                         )
                         x265_doc_path = _emit_upstream_doc(
-                            config.out, "x265", x265_tag, x265_html, logger,
+                            config.out, config.repo, "x265", x265_tag,
+                            x265_html, logger,
                         )
                     else:
                         logger.warn(
@@ -1086,7 +1121,8 @@ def _extract_and_write(
 
         if config.html_doc:
             _generate_html_doc(
-                doc_root, config.out, target_version, makeinfo_cmd, logger
+                doc_root, config.out, config.repo, target_version,
+                makeinfo_cmd, logger,
             )
 
     index = _build_index(
@@ -1099,6 +1135,7 @@ def _extract_and_write(
 def _generate_html_doc(
     doc_root: Path,
     out: Path,
+    repo: Path,
     target_version: str,
     makeinfo_cmd: list[str],
     logger: Logger,
@@ -1108,16 +1145,38 @@ def _generate_html_doc(
         logger.warn(f"Skipping HTML doc for {target_version}: ffmpeg.texi missing")
         return
 
-    # Overlay the vendored t2h.pm into the staged doc/. The tag's own t2h.pm
-    # may target an older Texinfo API (n7.x and earlier call $self->gdt which
-    # Texinfo 7.1+ removed); the vendored copy is version-gated and references
-    # the shared CSS at ../bootstrap.min.css / ../style.min.css so the HTML
-    # can live under {out}/doc/ffmpeg/{version}/ next to the shared assets.
-    staged_t2h = src.parent / _VENDORED_T2H
-    shutil.copyfile(_ASSETS_DIR / _VENDORED_T2H, staged_t2h)
+    # Stage the pinned-tag t2h.pm into the staged doc/, repointing its two CSS
+    # hrefs at the shared copies one directory up (see _T2H_* constants). The
+    # tag's own t2h.pm is not used: older tags target a removed Texinfo API.
+    t2h_bytes = _pinned_asset_bytes(repo, _T2H_DOC_PATH)
+    if t2h_bytes is None:
+        logger.warn(
+            f"Skipping HTML doc for {target_version}: {_PINNED_ASSET_TAG}:"
+            f"{_T2H_DOC_PATH} not found in {repo} — is the {_PINNED_ASSET_TAG} "
+            "tag present in --repo?"
+        )
+        return
+
+    t2h_text = t2h_bytes.decode("utf-8")
+    for old, new in _T2H_HREF_REPOINTS:
+        if old not in t2h_text:
+            logger.warn(
+                f"Skipping HTML doc for {target_version}: expected CSS href "
+                f"{old!r} not found in {_PINNED_ASSET_TAG}:{_T2H_DOC_PATH} — the "
+                "pinned init file changed shape; update _T2H_HREF_REPOINTS."
+            )
+            return
+        t2h_text = t2h_text.replace(old, new)
+
+    staged_t2h = src.parent / "t2h.pm"
+    staged_t2h.write_text(t2h_text, encoding="utf-8")
 
     doc_root_out = out / "doc" / "ffmpeg"
-    _ensure_shared_assets(doc_root_out)
+    if not _ensure_shared_assets(doc_root_out, repo, logger):
+        logger.warn(
+            f"Skipping HTML doc for {target_version}: shared CSS unavailable"
+        )
+        return
 
     output_path = doc_root_out / target_version / "ffmpeg-all.html"
     logger.info(f"Rendering HTML doc -> {output_path}")
@@ -1133,19 +1192,37 @@ def _generate_html_doc(
         logger.warn(f"HTML doc generation failed for {target_version}: {exc}")
 
 
-def _ensure_shared_assets(doc_root_out: Path) -> None:
-    """Copy the shared CSS files into ``doc_root_out`` if missing or stale."""
+def _ensure_shared_assets(doc_root_out: Path, repo: Path, logger: Logger) -> bool:
+    """Fetch the shared CSS files from the pinned tag into ``doc_root_out``.
+
+    Files already present (non-empty) are left alone. Returns ``True`` only if
+    every shared CSS file is present afterward. Writes go through a
+    PID-suffixed temp file + atomic replace so a concurrent worker never reads
+    a half-written stylesheet.
+    """
     doc_root_out.mkdir(parents=True, exist_ok=True)
+    complete = True
     for name in _SHARED_CSS_FILES:
-        src = _ASSETS_DIR / name
         dst = doc_root_out / name
-        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+        if dst.exists() and dst.stat().st_size > 0:
             continue
-        shutil.copyfile(src, dst)
+        data = _pinned_asset_bytes(repo, f"doc/{name}")
+        if data is None:
+            logger.warn(
+                f"Shared asset doc/{name} not found at {_PINNED_ASSET_TAG} in "
+                f"{repo}"
+            )
+            complete = False
+            continue
+        tmp = dst.with_name(f"{name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dst)
+    return complete
 
 
 def _emit_upstream_doc(
     out_root: Path,
+    repo: Path,
     project: str,
     identifier: str,
     html: str,
@@ -1184,8 +1261,9 @@ def _emit_upstream_doc(
             _upstream_emit_cache.add(key)
             return relative
 
-        # Ensure the shared CSS the page references exists. Cheap.
-        _ensure_shared_assets(out_root / "doc" / "ffmpeg")
+        # Ensure the shared CSS the page references exists (best-effort: an
+        # unstyled page still beats no page).
+        _ensure_shared_assets(out_root / "doc" / "ffmpeg", repo, logger)
 
         page_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = page_path.with_name(f"{page_path.name}.{os.getpid()}.tmp")

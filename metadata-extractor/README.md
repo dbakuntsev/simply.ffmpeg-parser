@@ -30,121 +30,66 @@ generated page live **once** at `<out>/doc/ffmpeg/`, shared by all versions.
 Each per-version HTML links to them via `../bootstrap.min.css` and
 `../style.min.css`.
 
-## Vendored assets (`ffmpeg_metadata_extractor/assets/`)
+## HTML rendering assets (fetched at build time)
 
-Three files are vendored from upstream FFmpeg and shipped with this package:
+The HTML renderer needs three files from FFmpeg's `doc/` tree:
 
-| File                | Origin                                          | Purpose                                  |
-|---------------------|-------------------------------------------------|------------------------------------------|
-| `bootstrap.min.css` | FFmpeg tag **n8.1.1**, `doc/bootstrap.min.css`  | Layout/typography for rendered HTML doc. |
-| `style.min.css`     | FFmpeg tag **n8.1.1**, `doc/style.min.css`      | FFmpeg site styling for rendered HTML.   |
-| `t2h.pm`            | FFmpeg tag **n8.1.1**, `doc/t2h.pm` (modified)  | `makeinfo --html` init file (theme).     |
+| File                | Source                                            | Purpose                                  |
+|---------------------|---------------------------------------------------|------------------------------------------|
+| `bootstrap.min.css` | `doc/bootstrap.min.css` at the pinned tag         | Layout/typography for rendered HTML doc. |
+| `style.min.css`     | `doc/style.min.css` at the pinned tag             | FFmpeg site styling for rendered HTML.   |
+| `t2h.pm`            | `doc/t2h.pm` at the pinned tag (modified in code) | `makeinfo --html` init file (theme).     |
 
-### Why these were vendored
+None of these are committed to this repo. They are fetched from `--repo` at
+build time via `git show <tag>:doc/<file>` (`_pinned_asset_bytes` in
+`extractor.py`) and written into the staged docs / output. This keeps the
+package **100% MIT**: `t2h.pm` carries an FFmpeg GPLv3+ header, and the project
+rule is that GPL-derived artifacts are generated at build time and never
+checked in. The CSS pair lands once at `<out>/doc/ffmpeg/`, shared by every
+version, which links to it via `../bootstrap.min.css` / `../style.min.css`.
 
-- **`t2h.pm`** — FFmpeg releases up to ~n7.x call removed Texinfo 6.x APIs
-  (`$self->gdt(...)`) directly. With a modern `makeinfo` (Texinfo 7.1+) the
-  original `t2h.pm` from those tags fails with
-  `Can't locate object method "gdt" via package "Texinfo::Convert::HTML"`,
-  and makeinfo silently produces no output. The n8.x `t2h.pm` is version-gated
-  (`$program_version_num >= 7.001090 ? cdt(...) : gdt(...)`) and works against
-  every Texinfo release we care about. Substituting it is safe because
-  `t2h.pm` is purely presentational: it controls heading levels, the
-  `<head>` block, TOC placement, and a few formatting callbacks — never the
-  documented content.
-- **`bootstrap.min.css` and `style.min.css`** — both are referenced by
-  `t2h.pm`'s `<head>` block and are required for the page to look correct.
-  Spot-checks against the FFmpeg repo showed `bootstrap.min.css` is byte-
-  identical from n5.1 through n8.1, and `style.min.css` is identical from
-  n5.1 through n7.1 with the n8.1.1 file being a strict superset (it appends
-  two extra rules used only by n8.x docs). A single shared copy of the
-  n8.1.1 version therefore styles every version correctly, and keeps the
-  shared assets out of every per-version directory.
+### The pinned tag
 
-### How `t2h.pm` was modified
+The tag is pinned (`_PINNED_ASSET_TAG = "n8.1.1"` in `extractor.py`), **not**
+"the tag being rendered". FFmpeg releases up to ~n7.x ship a `t2h.pm` that
+calls removed Texinfo 6.x APIs (`$self->gdt(...)`); under a modern `makeinfo`
+(Texinfo 7.1+) those fail with
+`Can't locate object method "gdt" via package "Texinfo::Convert::HTML"` and
+makeinfo silently produces no output. The n8.1.1 `t2h.pm` is version-gated
+(`$program_version_num >= 7.001090 ? cdt(...) : gdt(...)`) and renders across
+the full tag range. Substitution is safe because `t2h.pm` is purely
+presentational — heading levels, the `<head>` block, TOC placement, formatting
+callbacks — never the documented content. The n8.1.1 CSS pair styles every
+version correctly (spot-checks showed `bootstrap.min.css` byte-identical n5.1→n8.1,
+and `style.min.css` a strict superset of the older copies).
 
-Exactly two lines were edited from the upstream n8.1.1 file. The default
-emits CSS hrefs relative to the HTML file:
+**`--repo` must contain the `n8.1.1` tag** for HTML rendering. A full clone
+(as CI uses) always has it. If it is absent, HTML generation is skipped with a
+loud warning per version; JSON extraction is unaffected. Pass
+`--disable-html-doc` to skip HTML entirely.
+
+### The `t2h.pm` modification
+
+The only edit to the upstream file is two `href` rewrites, applied in code
+(`_T2H_HREF_REPOINTS` in `extractor.py`) so the modification lives as MIT
+source rather than a committed GPL derivative. The upstream `$head2` here-doc
+emits CSS relative to the HTML file:
 
 ```perl
     <link rel="stylesheet" type="text/css" href="bootstrap.min.css">
     <link rel="stylesheet" type="text/css" href="style.min.css">
 ```
 
-These were changed to reference the shared parent directory:
+Each is repointed one directory up (`href="../bootstrap.min.css"` etc.) so the
+shared CSS at `<out>/doc/ffmpeg/` resolves from `<out>/doc/ffmpeg/<version>/`.
+Each substitution must match exactly once; a miss (only possible if the pinned
+tag is changed to one whose `t2h.pm` differs) skips HTML with a loud warning
+naming the unmatched href.
 
-```perl
-    <link rel="stylesheet" type="text/css" href="../bootstrap.min.css">
-    <link rel="stylesheet" type="text/css" href="../style.min.css">
-```
+### Moving to a newer pinned tag
 
-No other edits. The change lives inside the `$head2` here-doc literal
-starting around line 303 of the file (search for `bootstrap.min.css`).
-
-### Refreshing the assets from a newer FFmpeg release
-
-When upstream FFmpeg cuts a new release that updates these files, follow this
-procedure to refresh the vendored copies. The `--check-assets` command (see
-below) is meant to detect when this needs to happen and assess the risk.
-
-1. **Pick a reference tag.** Usually the latest stable `n<major>.<minor>.0`
-   or `.<patch>`, e.g. `n8.2.0`.
-2. **Run the asset check first** to see what changed:
-
-   ```bash
-   ffmpeg-metadata-extract --repo /repos/ffmpeg --check-assets n8.2.0
-   ```
-
-   - `identical` → nothing to do for that file.
-   - `differs` + *upstream is a strict superset* → safe refresh; upstream
-     added rules without modifying existing ones.
-   - `differs` + *not a superset* → diff manually before replacing; existing
-     rules may have changed or been removed.
-3. **Copy the new bytes** from the reference tag into the assets directory:
-
-   ```bash
-   git -C /repos/ffmpeg show n8.2.0:doc/bootstrap.min.css \
-       > metadata-extractor/ffmpeg_metadata_extractor/assets/bootstrap.min.css
-   git -C /repos/ffmpeg show n8.2.0:doc/style.min.css \
-       > metadata-extractor/ffmpeg_metadata_extractor/assets/style.min.css
-   git -C /repos/ffmpeg show n8.2.0:doc/t2h.pm \
-       > metadata-extractor/ffmpeg_metadata_extractor/assets/t2h.pm
-   ```
-4. **Re-apply the `t2h.pm` modification** described above (two `href`
-   changes inside the `$head2` here-doc). Without this, generated HTML
-   pages will look for CSS in their own directory and render unstyled.
-5. **Update this README's "Origin" column** to the new tag.
-6. **Regenerate a few versions** end-to-end and spot-check the rendered HTML
-   in a browser to confirm styling still works for both old and new tags.
-
-## Checking vendored assets against upstream
-
-`--check-assets [TAG]` compares the vendored CSS files against the same files
-in an FFmpeg checkout, without running an extraction.
-
-```bash
-# Compare against the latest n<major>.<minor>.<patch> tag in --repo
-ffmpeg-metadata-extract --repo /repos/ffmpeg --check-assets
-
-# Compare against a specific tag
-ffmpeg-metadata-extract --repo /repos/ffmpeg --check-assets n8.2.0
-```
-
-For each asset, the command reports:
-
-- **identical** — vendored bytes match upstream.
-- **differs, upstream is a strict superset** — every byte of the vendored
-  copy appears verbatim inside the upstream copy. Upstream only added
-  content; a refresh will not remove or change existing rules. Low risk.
-- **differs, NOT a superset** — upstream has removed or modified content
-  the vendored copy contains. Review the diff before refreshing; the
-  generated HTML may depend on rules that no longer exist upstream.
-
-Exit codes: `0` all identical, `1` repo/tag lookup failed, `4` at least one
-asset differs (regardless of superset relationship).
-
-`t2h.pm` is deliberately **not** checked — it carries a local modification
-(the two CSS href rewrites), so a byte comparison would always report a
-diff. Refreshing it is a manual three-step process: copy from upstream,
-re-apply the two `href` edits, verify the file still loads with the
-installed Texinfo by running an extraction against an older tag.
+If a future Texinfo or FFmpeg release requires a newer init file, bump
+`_PINNED_ASSET_TAG` in `extractor.py`, confirm that tag's `doc/t2h.pm` still
+contains the two `href="bootstrap.min.css"` / `href="style.min.css"` lines
+(update `_T2H_HREF_REPOINTS` if not), and regenerate a few old + new versions
+end-to-end to confirm styling still works.

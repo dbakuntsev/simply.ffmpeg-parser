@@ -13,6 +13,3 @@ authors = [ { name = "Dmitry Bakuntsev" } ]
 
 [project.scripts]
 ffmpeg-metadata-extract = "ffmpeg_metadata_extractor.cli:main"
-
-[tool.setuptools.package-data]
-ffmpeg_metadata_extractor = ["assets/*"]
