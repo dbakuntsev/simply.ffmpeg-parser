@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -103,15 +104,24 @@ def _pinned_asset_bytes(repo: Path, path: str) -> bytes | None:
     return _pinned_asset_cache[path]
 
 
-# Cross-process print lock for parallel workers. ``None`` in the parent and
-# in sequential runs — only set in pool workers via :func:`_pool_initializer`
-# below. When set, every Logger emit serializes its single ``write() + flush()``
-# under this lock so concurrent workers don't tear each other's lines apart.
-# (Plain ``print()`` does two writes — payload and newline — and on Windows
-# with multiple processes inheriting the same stdout handle, those writes can
-# interleave at the byte level. The visible symptom was raw ``\\r\\n`` bytes
-# mid-line, rendered as ``♪◙`` by CP437-savvy terminals.)
-_print_lock = None
+# Log fan-in queue for parallel workers. ``None`` in the parent and in
+# sequential runs (where the single process writes to the console directly);
+# set in pool workers via :func:`_pool_initializer`. When set, a worker ships
+# each log line to the parent instead of writing it itself, and the parent's
+# drain thread is the *sole* writer to the console.
+#
+# A cross-process lock is not enough here: it serializes the Python-level
+# ``write()`` call, but on Windows several processes writing to the same
+# console handle still render torn — the visible symptom was raw ``\\r\\n``
+# bytes mid-line shown as ``♪◙`` (CP437 for CR/LF) under ``--jobs > 1``.
+# Funnelling every line back to the single parent writer eliminates that:
+# only one process ever touches the console, exactly as in sequential mode.
+_log_queue = None
+
+# Serializes the parent's own console writes (failure/summary lines emitted
+# from the main thread) against the queue-drain thread — both run in the
+# parent process during parallel extraction. Unused in workers.
+_console_lock = threading.Lock()
 
 # Cross-process lock that serializes upstream-library reference HTML
 # writes (x264 + x265). Several FFmpeg tags often pin the same upstream
@@ -137,12 +147,13 @@ _x265_parse_cache: "dict[str, object]" = {}
 _upstream_emit_cache: "set[str]" = set()
 
 
-def _pool_initializer(print_lock, upstream_doc_lock) -> None:
-    """Runs once per worker process at pool start-up. Stashes the shared
-    locks in module-level slots so every Logger emit and every upstream
-    doc write in this worker uses them."""
-    global _print_lock, _upstream_doc_lock
-    _print_lock = print_lock
+def _pool_initializer(log_queue, upstream_doc_lock) -> None:
+    """Runs once per worker process at pool start-up. Stashes the shared log
+    queue and upstream-doc lock in module-level slots so every Logger emit
+    ships to the parent and every upstream doc write in this worker is
+    serialized."""
+    global _log_queue, _upstream_doc_lock
+    _log_queue = log_queue
     _upstream_doc_lock = upstream_doc_lock
 
 
@@ -157,19 +168,37 @@ def _upstream_emit_context():
     )
 
 
-def _write_line(stream: str, line: str) -> None:
-    """Single ``write()+flush()`` (under the shared lock if pooled). One
-    syscall per line is the smallest interleave-resistant unit available
-    without buffering; the lock is the extra guard for the multi-worker case.
+def _emit_to_console(stream: str, line: str) -> None:
+    """Write one line to the real console as a single ``write()+flush()``.
+
+    Only ever called in the parent (or in a sequential run) — the
+    ``_console_lock`` serializes the drain thread against the main thread.
     """
     target = sys.stderr if stream == "stderr" else sys.stdout
-    if _print_lock is not None:
-        with _print_lock:
-            target.write(line + "\n")
-            target.flush()
-    else:
+    with _console_lock:
         target.write(line + "\n")
         target.flush()
+
+
+def _write_line(stream: str, line: str) -> None:
+    """Emit a log line. In a pool worker (``_log_queue`` set) the line is
+    shipped to the parent's drain thread; otherwise it goes straight to the
+    console. This keeps a single process as the sole console writer."""
+    if _log_queue is not None:
+        _log_queue.put((stream, line))
+    else:
+        _emit_to_console(stream, line)
+
+
+def _drain_log_queue(log_queue) -> None:
+    """Parent-side worker: write queued worker log lines to the console until
+    the sentinel (``None``) arrives. The single console writer for pooled mode."""
+    while True:
+        item = log_queue.get()
+        if item is None:
+            return
+        stream, line = item
+        _emit_to_console(stream, line)
 
 
 class Logger:
@@ -178,7 +207,8 @@ class Logger:
     ``tag`` (when set) is prepended to every line as ``[{tag}] `` so output
     from concurrently-extracting workers stays attributable. Writes happen
     immediately — no buffering — so users see progress as it streams. In
-    pooled mode the writes are serialized via ``_print_lock``.
+    pooled mode each line is shipped to the parent's drain thread (the sole
+    console writer) via ``_log_queue``.
     """
 
     def __init__(self, verbose: bool, *, tag: str | None = None) -> None:
@@ -205,10 +235,11 @@ def _extract_for_tag_pooled(
 ) -> bool:
     """Worker entry point for ``--jobs > 1`` extraction.
 
-    The worker writes its log lines directly (under the shared lock set up
-    in :func:`_pool_initializer`) so users see streaming progress. Returns
-    ``True`` on success, ``False`` after warning about the failure — the
-    parent only needs the boolean to track failures.
+    The worker ships its log lines to the parent's drain thread via the queue
+    set up in :func:`_pool_initializer`, so users see streaming progress while
+    a single process remains the sole console writer. Returns ``True`` on
+    success, ``False`` after warning about the failure — the parent only needs
+    the boolean to track failures.
     """
     logger = Logger(config.verbose, tag=tag)
     try:
@@ -1320,10 +1351,11 @@ def run_extraction(config: ExtractConfig) -> int:
         # worker gets its own tempdir per tag, so file-system isolation is
         # already in place.
         #
-        # Each worker prints its log lines directly (streaming, no buffering)
-        # under a shared lock installed by ``_pool_initializer`` — that's how
-        # we keep concurrent stdout writes from interleaving at the byte level
-        # while still letting users watch progress.
+        # Workers ship their log lines to the parent over ``log_queue``; a
+        # parent-side drain thread is the sole console writer (streaming, no
+        # buffering). A shared lock alone wouldn't fix the multi-process
+        # console tearing on Windows (the ``♪◙`` regression) — only one
+        # process writing does.
         #
         # We don't pre-flight ``--continue-on-error: False``: with multiple
         # tags already in flight, "bail at first error" can't unwind the
@@ -1331,34 +1363,44 @@ def run_extraction(config: ExtractConfig) -> int:
         # then return non-zero — same exit code as before, slightly more
         # work done than necessary in the failure case.
         mp_ctx = multiprocessing.get_context()
-        print_lock = mp_ctx.Lock()
+        log_queue = mp_ctx.Queue()
         upstream_doc_lock = mp_ctx.Lock()
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=mp_ctx,
-            initializer=_pool_initializer,
-            initargs=(print_lock, upstream_doc_lock),
-        ) as pool:
-            future_to_tag = {
-                pool.submit(_extract_for_tag_pooled, config, tag, makeinfo_cmd): tag
-                for tag in tags
-            }
-            for future in concurrent.futures.as_completed(future_to_tag):
-                tag = future_to_tag[future]
-                try:
-                    ok = future.result()
-                except Exception as exc:
-                    # The worker function itself failed to *return* — segfault,
-                    # pickle error, OOM. No log surfaces; report the crash and
-                    # move on. Use ``info``-style write so the line carries the
-                    # ``[{tag}]`` prefix like the rest.
-                    logger.warn(
-                        f"[{tag}] Worker died: {type(exc).__name__}: {exc}"
-                    )
-                    failures.append(tag)
-                    continue
-                if not ok:
-                    failures.append(tag)
+        drain_thread = threading.Thread(
+            target=_drain_log_queue, args=(log_queue,), daemon=True
+        )
+        drain_thread.start()
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=mp_ctx,
+                initializer=_pool_initializer,
+                initargs=(log_queue, upstream_doc_lock),
+            ) as pool:
+                future_to_tag = {
+                    pool.submit(_extract_for_tag_pooled, config, tag, makeinfo_cmd): tag
+                    for tag in tags
+                }
+                for future in concurrent.futures.as_completed(future_to_tag):
+                    tag = future_to_tag[future]
+                    try:
+                        ok = future.result()
+                    except Exception as exc:
+                        # The worker function itself failed to *return* —
+                        # segfault, pickle error, OOM. No log surfaces; report
+                        # the crash and move on. ``warn`` carries the
+                        # ``[{tag}]`` prefix like the rest.
+                        logger.warn(
+                            f"[{tag}] Worker died: {type(exc).__name__}: {exc}"
+                        )
+                        failures.append(tag)
+                        continue
+                    if not ok:
+                        failures.append(tag)
+        finally:
+            # Pool is shut down (workers exited gracefully and flushed their
+            # queued lines); stop the drain thread once it has written them.
+            log_queue.put(None)
+            drain_thread.join()
 
     if failures:
         logger.warn(f"Extraction failed for tags: {', '.join(failures)}")
