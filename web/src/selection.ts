@@ -381,22 +381,29 @@ function buildOptionSelection(
   const extraDocs: SelectionDocLink[] = [];
   if (enrichment?.docLink) extraDocs.push(enrichment.docLink);
 
-  // x264 reference link — surfaces only when the resolver attributed
-  // this option to a libx264-family codec AND the bundle advertises a
-  // rendered x264 reference page. The page's per-option anchors come
-  // from the same bare names we use elsewhere ( ``crf`` from ``-crf`` ),
-  // so the deep link works without any further coordination.
-  const x264DocPath = metadata.index?.x264_doc;
-  if (
-    x264DocPath &&
-    binding.resolutionSource === "codec-private" &&
-    binding.matchedCodec &&
-    /^libx264/.test(binding.matchedCodec)
-  ) {
-    extraDocs.push({
-      label: "x264 reference",
-      url: `./${x264DocPath}#option-${encodeURIComponent(base.slice(1))}`,
-    });
+  // Upstream-library reference link — surfaces only when the resolver
+  // attributed this option to a lib{x264,x265}-family codec AND the
+  // bundle advertises a rendered reference page. The page's per-option
+  // anchors come from the same bare names we use elsewhere (``crf``
+  // from ``-crf``), so the deep link works without further coordination.
+  const upstreamRefs: Array<{
+    family: RegExp;
+    docPath: string | undefined;
+    label: string;
+  }> = [
+    { family: /^libx264/, docPath: metadata.index?.x264_doc, label: "x264 reference" },
+    { family: /^libx265/, docPath: metadata.index?.x265_doc, label: "x265 reference" },
+  ];
+  if (binding.resolutionSource === "codec-private" && binding.matchedCodec) {
+    for (const ref of upstreamRefs) {
+      if (ref.docPath && ref.family.test(binding.matchedCodec)) {
+        extraDocs.push({
+          label: ref.label,
+          url: `./${ref.docPath}#option-${encodeURIComponent(base.slice(1))}`,
+        });
+        break;
+      }
+    }
   }
 
   // Surface the option's documented values (e.g. ``-fflags`` flag names,

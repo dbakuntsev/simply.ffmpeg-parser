@@ -25,61 +25,16 @@ preserved (the SPA renders them with ``whitespace: pre-line``).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 
+# Generic help-doc structures live in ``upstream_help`` so both the x264
+# and x265 parsers share one shape (and one HTML renderer). The aliases
+# below keep the historical ``X264*`` names working for any in-repo
+# references that predate the rename.
+from .upstream_help import HelpDoc, HelpSection, UpstreamOptionHelp
 
-@dataclass(frozen=True)
-class UpstreamOptionHelp:
-    """Per-option help text mined from an upstream library's source.
-
-    ``description``: the option header line (one short paragraph,
-    e.g. ``Quality-based VBR (0-51) [23.0]`` from ``--crf`` in x264.c).
-    Empty when the upstream source documents the option only as a value
-    list (no separate header description) or when the option couldn't be
-    found at all.
-
-    ``values``: list of ``(value_name, value_description)`` pairs for
-    enum-style options (preset, tune, profile). Empty for options whose
-    value is a free-form number/string with no enumerated set.
-
-    The two fields are independent: an option may have only a description
-    (``--crf``), only values (``--profile``), both (``--preset``), or
-    neither (skip).
-    """
-
-    description: str = ""
-    values: list[tuple[str, str]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class X264Section:
-    """A heading-grouped run of options from x264's ``--fullhelp`` output.
-
-    ``title`` is the section header text without its trailing colon
-    (e.g. ``"Presets"``, ``"Frame-type options"``, ``"Ratecontrol"``).
-    ``options`` lists ``(option_name, help)`` pairs in source order so
-    a doc renderer can emit options as the user reading the CLI help
-    would encounter them — preserving x264's curated grouping.
-    """
-
-    title: str
-    options: list[tuple[str, UpstreamOptionHelp]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class X264HelpDoc:
-    """Section-ordered view of the x264 help text plus a by-name index.
-
-    ``sections`` is what the doc renderer iterates over: each section's
-    options appear in the order x264.c emits them. ``options`` is the
-    flat lookup dict used by the extractor's option-overlay step (and
-    what the older :func:`parse_x264_help` returns directly). Both
-    views reference the same :class:`UpstreamOptionHelp` instances.
-    """
-
-    sections: list[X264Section] = field(default_factory=list)
-    options: dict[str, UpstreamOptionHelp] = field(default_factory=dict)
+X264Section = HelpSection
+X264HelpDoc = HelpDoc
 
 
 _STRING_LITERAL = re.compile(r'"((?:\\.|[^"\\])*)"')
@@ -133,6 +88,7 @@ _STRTABLE_HEAD = re.compile(
 # ``<limits.h>`` / ``<float.h>`` which we don't parse.
 _SEED_CONSTANTS: dict[str, int | float] = {
     "BIT_DEPTH": 8,
+    "X265_DEPTH": 8,  # x265's compile-time internal bit depth (build -D flag)
     "INT_MAX": 2_147_483_647,
     "INT_MIN": -2_147_483_648,
     "UINT_MAX": 4_294_967_295,
@@ -440,21 +396,27 @@ def _find_matching_paren(text: str, open_idx: int) -> int:
     return -1
 
 
-def _to_python_expr(c_expr: str, defaults: dict, constants: dict) -> str | None:
+def _to_python_expr(
+    c_expr: str, defaults: dict, constants: dict, var_name: str = "defaults"
+) -> str | None:
     """Best-effort translation of a C expression to a Python expression
     with names substituted from ``defaults`` and ``constants``.
 
-    Returns ``None`` when the expression contains constructs we don't
-    handle (function calls beyond ``X264_MIN``/``X264_MAX``, ternaries
-    with un-resolvable operands, etc.).
-    """
-    # Handle ``X264_MIN(a, b)`` / ``X264_MAX(a, b)`` first — common in
-    # x264.c for clamping default ranges. Replace with ``min(a, b)`` /
-    # ``max(a, b)`` so Python's built-ins (whitelisted below) take over.
-    expr = re.sub(r"\bX264_MIN\b", "min", c_expr)
-    expr = re.sub(r"\bX264_MAX\b", "max", expr)
+    ``var_name`` is the C variable that holds the default-bearing struct
+    pointer in the source being parsed — ``defaults`` for x264.c's
+    ``help()``, ``param`` for x265cli.cpp's ``showHelp()``.
 
-    # Substitute ``defaults->path.to.field`` references.
+    Returns ``None`` when the expression contains constructs we don't
+    handle (function calls beyond ``X264_MIN``/``X264_MAX``/``X265_MIN``/
+    ``X265_MAX``, ternaries with un-resolvable operands, etc.).
+    """
+    # Handle ``{X264,X265}_MIN(a, b)`` / ``_MAX(a, b)`` first — common in
+    # both projects for clamping default ranges. Replace with Python's
+    # ``min(a, b)`` / ``max(a, b)`` (whitelisted in :func:`_safe_eval`).
+    expr = re.sub(r"\bX26[45]_MIN\b", "min", c_expr)
+    expr = re.sub(r"\bX26[45]_MAX\b", "max", expr)
+
+    # Substitute ``<var_name>->path.to.field`` references.
     def repl_default(m: re.Match[str]) -> str:
         path = m.group(1)
         if path in defaults:
@@ -462,7 +424,9 @@ def _to_python_expr(c_expr: str, defaults: dict, constants: dict) -> str | None:
             return repr(val) if val is not None else "None"
         return f"__UNRESOLVED_{path.replace('.', '_')}"
 
-    expr = re.sub(r"defaults\s*->\s*([\w.]+)", repl_default, expr)
+    expr = re.sub(
+        rf"{re.escape(var_name)}\s*->\s*([\w.]+)", repl_default, expr
+    )
 
     # Substitute bare ALL_CAPS identifiers (C-style constants).
     def repl_const(m: re.Match[str]) -> str:
@@ -520,6 +484,13 @@ def _parse_constants(headers_text: str) -> dict[str, int | float | str | None]:
     if not headers_text:
         return dict(_SEED_CONSTANTS)
 
+    # Strip C comments first — many ``#define`` lines carry a trailing
+    # ``/* ... */`` (e.g. x265's ``#define QP_MAX_MAX 69 /* ... */``).
+    # Leaving them in makes the RHS un-evaluable. Block comments are
+    # removed before line comments so a ``//`` inside ``/* */`` is safe.
+    headers_text = _BLOCK_COMMENT.sub(" ", headers_text)
+    headers_text = _LINE_COMMENT.sub("", headers_text)
+
     raw: dict[str, str] = {}
     for m in _DEFINE.finditer(headers_text):
         name = m.group(1)
@@ -560,9 +531,15 @@ def _parse_constants(headers_text: str) -> dict[str, int | float | str | None]:
 
 
 def _parse_defaults(
-    base_c_text: str, constants: dict[str, int | float | str | None]
+    base_c_text: str,
+    constants: dict[str, int | float | str | None],
+    func_sig: str = r"\bx264_param_default\s*\(\s*x264_param_t\s*\*\s*\w+\s*\)\s*\n*\{",
 ) -> dict[str, int | float | str | None]:
     """Extract ``param->X.Y = EXPR;`` from ``x264_param_default()`` body.
+
+    ``func_sig`` is the regex that locates the defaults function's
+    opening brace; the x265 caller passes the ``x265_param_default``
+    signature instead.
 
     Returns ``{"X.Y": value}`` for every assignment seen, with the
     resolved value or ``None`` when the RHS can't be evaluated (function
@@ -582,10 +559,7 @@ def _parse_defaults(
         return {}
 
     # Find the function body via brace matching.
-    sig = re.search(
-        r"\bx264_param_default\s*\(\s*x264_param_t\s*\*\s*\w+\s*\)\s*\n*\{",
-        base_c_text,
-    )
+    sig = re.search(func_sig, base_c_text)
     if not sig:
         return {}
     open_brace = sig.end() - 1
@@ -719,33 +693,66 @@ def _resolve_arg_value(
     defaults: dict[str, int | float | str | None],
     constants: dict[str, int | float | str | None],
     string_tables: dict[str, list[str]] | None = None,
+    var_name: str = "defaults",
+    opt_macro: bool = False,
 ) -> object | None:
     """Try to evaluate one printf argument.
+
+    ``var_name`` is the default-bearing struct pointer in the source
+    being parsed (``defaults`` for x264, ``param`` for x265).
+    ``opt_macro`` enables x265's ``OPT(param->X)`` wrapper, which maps a
+    boolean field to ``"enabled"`` / ``"disabled"``.
 
     Return values carry three-way information:
 
     - Resolved value (int, float, str) → use directly.
     - ``None`` → arg references a runtime-determined value (or is an
       expression we can't simplify); leave the placeholder literal.
-    - :data:`_MEMSET_DEFAULT` → arg references a struct field that
-      ``x264_param_default()`` left untouched, so it inherits zero from
-      the function-entry memset. :func:`_resolve_format` substitutes
-      zero of the format spec's type.
+    - :data:`_MEMSET_DEFAULT` → arg references a struct field that the
+      ``*_param_default()`` function left untouched, so it inherits zero
+      from the function-entry memset. :func:`_resolve_format`
+      substitutes zero of the format spec's type.
     """
     arg = arg.strip()
     if not arg:
         return None
     tables = string_tables or {}
 
-    # ``strtable_lookup( table_name, defaults->X )`` — x264 emits this
-    # in many ``%s`` printf args to translate an integer enum value to
-    # the human-readable name. Resolve it by combining a parsed name
-    # table (group 1) with the integer default of the indexed field
-    # (group 2). Memset-zeroed indices land at table[0], which is the
-    # right answer in every case x264 follows the convention "enum
-    # value 0 is the documented default".
+    # ``OPT( param->X )`` — x265's boolean-rendering macro
+    # (``#define OPT(value) (value ? "enabled" : "disabled")``). Resolve
+    # the inner field default and map truthiness to the two strings. A
+    # memset-zeroed field counts as disabled.
+    if opt_macro:
+        om = re.fullmatch(r"OPT\s*\(\s*(.+?)\s*\)", arg)
+        if om:
+            inner = _resolve_arg_value(
+                om.group(1), defaults, constants, string_tables,
+                var_name=var_name, opt_macro=False,
+            )
+            if inner is _MEMSET_DEFAULT:
+                return "disabled"
+            if inner is None:
+                return None
+            try:
+                return "enabled" if inner else "disabled"
+            except Exception:
+                return None
+
+    # Strip a C++ namespace qualifier (``X265_NS::logLevelNames`` →
+    # ``logLevelNames``) so the table/expression handlers below see a
+    # bare symbol. Only done for the leading qualifier of the whole arg.
+    arg = re.sub(r"^(?:\w+::)+", "", arg)
+
+    # ``strtable_lookup( table_name, <var>->X )`` — x264 emits this in
+    # many ``%s`` printf args to translate an integer enum value to the
+    # human-readable name. Resolve it by combining a parsed name table
+    # (group 1) with the integer default of the indexed field (group 2).
+    # Memset-zeroed indices land at table[0], which is the right answer
+    # in every case x264 follows the convention "enum value 0 is the
+    # documented default".
     sm = re.fullmatch(
-        r"strtable_lookup\s*\(\s*(\w+)\s*,\s*defaults\s*->\s*([\w.]+)\s*\)",
+        rf"strtable_lookup\s*\(\s*(\w+)\s*,\s*{re.escape(var_name)}"
+        r"\s*->\s*([\w.]+)\s*\)",
         arg,
     )
     if sm:
@@ -780,26 +787,32 @@ def _resolve_arg_value(
         table = tables.get(sm.group(1))
         return ", ".join(table) if table is not None else None
 
-    # ``table_name[N]`` — direct indexing of a name table by a literal
-    # integer. x264 uses ``x264_muxer_names[0]`` etc. to surface the
-    # first/default entry of a table in the help header.
-    sm = re.fullmatch(r"(\w+)\s*\[\s*(\d+)\s*\]", arg)
+    # ``table_name[INDEX]`` — indexing of a name table. x264 uses a
+    # literal index (``x264_muxer_names[0]``); x265 uses an expression
+    # (``logLevelNames[param->logLevel + 1]``). Resolve the index via
+    # the expression evaluator so both forms work.
+    sm = re.fullmatch(r"(\w+)\s*\[\s*(.+?)\s*\]", arg)
     if sm:
         table = tables.get(sm.group(1))
         if table is not None:
-            idx = int(sm.group(2))
-            if 0 <= idx < len(table):
+            idx_expr = sm.group(2)
+            if re.fullmatch(r"\d+", idx_expr):
+                idx = int(idx_expr)
+            else:
+                py = _to_python_expr(idx_expr, defaults, constants, var_name)
+                idx = _safe_eval(py) if py is not None else None
+            if isinstance(idx, int) and 0 <= idx < len(table):
                 return table[idx]
+            return None
 
-    # Direct ``defaults->X.Y`` or ``defaults->X.Y[N]`` access. Array
-    # indexing matters for fields like ``analyse.i_luma_deadzone[0]``
-    # — the regex only captures the path up to (but not including) the
-    # bracket; the index is captured separately. When the path is
-    # present in defaults and its value is a list/tuple, return the
-    # indexed element; otherwise fall through to the memset-default
-    # logic (array fields x264 never explicitly assigns are zeroed
-    # just like scalars).
-    m = re.fullmatch(r"defaults\s*->\s*([\w.]+)(?:\[(\d+)\])?", arg)
+    # Direct ``<var>->X.Y`` or ``<var>->X.Y[N]`` access. Array indexing
+    # matters for fields like ``analyse.i_luma_deadzone[0]`` — the regex
+    # only captures the path up to (but not including) the bracket; the
+    # index is captured separately. When the path is present in defaults
+    # and its value is a list/tuple, return the indexed element;
+    # otherwise fall through to the memset-default logic (array fields
+    # never explicitly assigned are zeroed just like scalars).
+    m = re.fullmatch(rf"{re.escape(var_name)}\s*->\s*([\w.]+)(?:\[(\d+)\])?", arg)
     if m:
         path = m.group(1)
         index_str = m.group(2)
@@ -812,8 +825,8 @@ def _resolve_arg_value(
                 return _MEMSET_DEFAULT
             # Either a resolved value or None (mentioned-but-inevaluable).
             return value
-        # Not mentioned in x264_param_default() → memset-zeroed at
-        # function entry; surface that distinction to the caller.
+        # Not mentioned in the *_param_default() function → memset-zeroed
+        # at function entry; surface that distinction to the caller.
         return _MEMSET_DEFAULT
     # Bare numeric literal.
     if re.fullmatch(r"-?\d+", arg):
@@ -828,7 +841,7 @@ def _resolve_arg_value(
     if re.fullmatch(r"[A-Z_][A-Z0-9_]*", arg) and arg in constants:
         return constants[arg]
     # Expression — substitute and try to eval.
-    py_expr = _to_python_expr(arg, defaults, constants)
+    py_expr = _to_python_expr(arg, defaults, constants, var_name)
     if py_expr is None:
         return None
     return _safe_eval(py_expr)
@@ -858,11 +871,17 @@ def _resolve_format(
     defaults: dict[str, int | float | str | None],
     constants: dict[str, int | float | str | None],
     string_tables: dict[str, list[str]] | None = None,
+    var_name: str = "defaults",
+    opt_macro: bool = False,
 ) -> str:
     """Walk ``fmt``, substituting each ``%X`` specifier with the
     formatted value of the matching ``args`` entry. Unresolved args
     leave the specifier intact so the reader can still tell something
-    was deferred."""
+    was deferred.
+
+    ``var_name`` / ``opt_macro`` are forwarded to
+    :func:`_resolve_arg_value` for x265's ``param->X`` references and
+    ``OPT()`` macro."""
     out: list[str] = []
     arg_idx = 0
     i = 0
@@ -878,7 +897,8 @@ def _resolve_format(
                 spec = m.group(0)
                 value = (
                     _resolve_arg_value(
-                        args[arg_idx], defaults, constants, string_tables
+                        args[arg_idx], defaults, constants, string_tables,
+                        var_name=var_name, opt_macro=opt_macro,
                     )
                     if arg_idx < len(args)
                     else None

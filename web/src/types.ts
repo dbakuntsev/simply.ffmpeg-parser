@@ -109,6 +109,10 @@ export interface MetadataIndex {
    * extractor wasn't run with ``--x264-repo``. The SPA's inspector
    * uses this to deep-link from libx264 options to ``#option-<name>``. */
   x264_doc?: string;
+  /** Same as ``x264_doc`` but for libx265, keyed per x265 release tag
+   * (``"doc/x265/4.2/x265-reference.html"``). Absent without
+   * ``--x265-repo``. */
+  x265_doc?: string;
 }
 
 export interface OptionsMetadata {

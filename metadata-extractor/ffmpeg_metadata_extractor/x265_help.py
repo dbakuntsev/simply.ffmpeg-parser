@@ -26,7 +26,47 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .x264_help import UpstreamOptionHelp
+from .upstream_help import HelpDoc, HelpSection, UpstreamOptionHelp
+from .x264_help import (
+    _H_CALL,
+    _STRING_LITERAL,
+    _decode_escapes,
+    _find_matching_paren,
+    _parse_constants,
+    _parse_defaults,
+    _parse_string_tables,
+    _resolve_format,
+    _split_top_level_commas,
+)
+
+# x265 ``showHelp(x265_param* param)`` — locate the opening brace.
+_X265_SHOWHELP_SIG = r"\bshowHelp\s*\(\s*x265_param\s*\*\s*\w+\s*\)\s*\n*\{"
+# x265's defaults function (same flat ``param->X = …;`` shape as x264).
+_X265_PARAM_DEFAULT_SIG = (
+    r"\bx265_param_default\s*\(\s*x265_param\s*\*\s*\w+\s*\)\s*\n*\{"
+)
+
+# Section header in the flattened help: capitalized text + colon at
+# column 0. x265 titles carry commas and slashes ("Profile, Level,
+# Tier:", "Temporal / motion search options:"), so the character class
+# is broader than x264's.
+_X265_SECTION = re.compile(r"^([A-Z][A-Za-z][A-Za-z ,/\-]*):\s*$")
+
+# x265 option header. Handles the short-slash prefix (``-D/--``), the
+# ``--[no-]`` boolean-toggle form, and an optional value spec that may
+# be ``<...>`` OR a bare token like ``8|10|12`` / ``WxH`` / ``bff|tff``.
+# Captures the long option name (group 1) and the trailing description
+# (group 2). Bounded leading indent keeps continuation lines (col 33+)
+# from being misread as headers.
+_X265_OPTION_HEADER = re.compile(
+    r"^[ \t]{0,4}(?:-\w/)?--(?:\[no-?\])?([A-Za-z][\w-]*)"
+    r"(?:\s+(?:<[^>]*>|[\w|]+x?[\w|]*))?(?:\s{2,}(.*?))?\s*$"
+)
+
+# Continuation line of an option description: indented to roughly the
+# description column (col 28-34) — below the value-marker territory and
+# above the option-header indent envelope.
+_X265_DESC_CONTINUATION = re.compile(r"^\s{20,}(\S.*?)\s*$")
 
 
 # ``if (!strcmp(NAME_VAR, "VALUE"))`` — ``NAME_VAR`` is ``preset``,
@@ -207,6 +247,33 @@ def _extract_profile_names(body: str) -> list[tuple[str, str]]:
     return out
 
 
+def _extract_value_lists(
+    param_cpp: str, level_cpp: str
+) -> dict[str, list[tuple[str, str]]]:
+    """Return ``{option: [(value, description)]}`` for preset / tune /
+    profile, mined from the x265 implementation cascades (the CLI help
+    only prints the bare value names with no per-value detail)."""
+    out: dict[str, list[tuple[str, str]]] = {}
+    if param_cpp:
+        clean = _strip_comments(param_cpp)
+        body = _find_function_body(clean, "x265_param_default_preset")
+        if body:
+            presets = _extract_strcmp_cascade(body, "preset")
+            if presets:
+                out["preset"] = presets
+            tunes = _extract_strcmp_cascade(body, "tune")
+            if tunes:
+                out["tune"] = tunes
+    if level_cpp:
+        clean = _strip_comments(level_cpp)
+        body = _find_function_body(clean, "x265_param_apply_profile")
+        if body:
+            profiles = _extract_profile_names(body)
+            if profiles:
+                out["profile"] = profiles
+    return out
+
+
 def parse_x265_help(
     param_cpp: str, level_cpp: str
 ) -> dict[str, UpstreamOptionHelp]:
@@ -226,25 +293,185 @@ def parse_x265_help(
     Either argument may be empty; the corresponding entries simply don't
     appear in the result.
     """
-    out: dict[str, UpstreamOptionHelp] = {}
+    return {
+        name: UpstreamOptionHelp(values=values)
+        for name, values in _extract_value_lists(param_cpp, level_cpp).items()
+    }
 
-    if param_cpp:
-        clean = _strip_comments(param_cpp)
-        body = _find_function_body(clean, "x265_param_default_preset")
-        if body:
-            presets = _extract_strcmp_cascade(body, "preset")
-            if presets:
-                out["preset"] = UpstreamOptionHelp(values=presets)
-            tunes = _extract_strcmp_cascade(body, "tune")
-            if tunes:
-                out["tune"] = UpstreamOptionHelp(values=tunes)
 
-    if level_cpp:
-        clean = _strip_comments(level_cpp)
-        body = _find_function_body(clean, "x265_param_apply_profile")
-        if body:
-            profiles = _extract_profile_names(body)
-            if profiles:
-                out["profile"] = UpstreamOptionHelp(values=profiles)
+def _flatten_x265_help(
+    cli_cpp: str,
+    defaults: dict[str, int | float | str | None],
+    constants: dict[str, int | float | str | None],
+    string_tables: dict[str, list[str]],
+) -> str:
+    """Slice ``showHelp()`` from ``x265cli.cpp`` and return the flat help
+    text with printf-style placeholders resolved.
 
-    return out
+    Same H-call walking as :func:`.x264_help._extract_help_text`, but
+    against x265's ``H0``/``H1`` macros (both ``printf``-backed) with
+    ``param->X`` field references and the ``OPT()`` bool macro.
+    """
+    m = re.search(_X265_SHOWHELP_SIG, cli_cpp)
+    if not m:
+        return ""
+    open_brace = m.end() - 1
+    # Walk to the matching close brace (string-literal aware).
+    depth = 0
+    i = open_brace
+    n = len(cli_cpp)
+    body_end = -1
+    while i < n:
+        ch = cli_cpp[i]
+        if ch == '"':
+            i += 1
+            while i < n and cli_cpp[i] != '"':
+                if cli_cpp[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                body_end = i
+                break
+        i += 1
+    if body_end == -1:
+        return ""
+    body = cli_cpp[open_brace : body_end + 1]
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.DOTALL)
+    body = re.sub(r"//[^\n]*", "", body)
+    body = re.sub(
+        r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|else|endif|error|warning|pragma)\b[^\n]*\n?",
+        "",
+        body,
+        flags=re.MULTILINE,
+    )
+
+    parts: list[str] = []
+    for hm in _H_CALL.finditer(body):
+        open_paren = hm.end() - 1
+        close_paren = _find_matching_paren(body, open_paren)
+        if close_paren == -1:
+            continue
+        inside = body[open_paren + 1 : close_paren]
+        comma_parts = _split_top_level_commas(inside)
+        if not comma_parts:
+            continue
+        fmt = "".join(
+            _decode_escapes(sm.group(1))
+            for sm in _STRING_LITERAL.finditer(comma_parts[0])
+        )
+        if not fmt:
+            continue
+        parts.append(
+            _resolve_format(
+                fmt,
+                comma_parts[1:],
+                defaults,
+                constants,
+                string_tables,
+                var_name="param",
+                opt_macro=True,
+            )
+        )
+    return "".join(parts)
+
+
+def parse_x265_doc(
+    cli_cpp: str,
+    param_cpp: str,
+    level_cpp: str,
+    *,
+    common_h: str = "",
+    x265_h: str = "",
+) -> HelpDoc:
+    """Parse x265's CLI help into a section-ordered :class:`HelpDoc`.
+
+    ``cli_cpp`` is ``source/x265cli.cpp`` (the ``showHelp()`` function).
+    ``param_cpp`` / ``level_cpp`` supply preset/tune/profile value lists
+    (merged onto the matching options). ``common_h`` / ``x265_h`` feed
+    the ``#define`` constant table and string-name tables used to
+    resolve ``%d`` / ``%s`` placeholders against ``x265_param_default``.
+    """
+    constants = _parse_constants(common_h + "\n\n" + x265_h)
+    defaults = _parse_defaults(param_cpp, constants, _X265_PARAM_DEFAULT_SIG)
+    # Name tables (logLevelNames etc.) live in headers + param.h. Pass
+    # everything we have; the parser is tolerant of duplicate symbols.
+    string_tables = _parse_string_tables(common_h, x265_h, cli_cpp, param_cpp)
+
+    flat = _flatten_x265_help(cli_cpp, defaults, constants, string_tables)
+    if not flat:
+        return HelpDoc()
+
+    sections: list[HelpSection] = []
+    by_name: dict[str, UpstreamOptionHelp] = {}
+    current_section: HelpSection | None = None
+    current_option: str | None = None
+    current_desc_lines: list[str] = []
+
+    def ensure_section() -> HelpSection:
+        nonlocal current_section
+        if current_section is None:
+            current_section = HelpSection(title="General", options=[])
+            sections.append(current_section)
+        return current_section
+
+    def flush_option() -> None:
+        nonlocal current_option, current_desc_lines
+        if current_option is not None and current_option not in by_name:
+            entry = UpstreamOptionHelp(
+                description="\n".join(current_desc_lines).strip()
+            )
+            by_name[current_option] = entry
+            ensure_section().options.append((current_option, entry))
+        current_option = None
+        current_desc_lines = []
+
+    for line in flat.split("\n"):
+        sec = _X265_SECTION.match(line)
+        if sec:
+            flush_option()
+            current_section = HelpSection(title=sec.group(1), options=[])
+            sections.append(current_section)
+            continue
+        opt = _X265_OPTION_HEADER.match(line)
+        if opt:
+            flush_option()
+            current_option = opt.group(1)
+            desc = opt.group(2) or ""
+            current_desc_lines = [desc] if desc else []
+            continue
+        if current_option is None:
+            continue
+        cont = _X265_DESC_CONTINUATION.match(line)
+        if cont:
+            current_desc_lines.append(cont.group(1))
+
+    flush_option()
+
+    # Merge preset/tune/profile value lists onto their matching options.
+    for name, values in _extract_value_lists(param_cpp, level_cpp).items():
+        existing = by_name.get(name)
+        if existing is not None:
+            merged = UpstreamOptionHelp(
+                description=existing.description, values=values
+            )
+            by_name[name] = merged
+            for section in sections:
+                section.options[:] = [
+                    (n, merged if n == name else h) for n, h in section.options
+                ]
+        else:
+            # The CLI help didn't surface this option (unlikely) — drop it
+            # into a synthetic Presets section so it still appears.
+            entry = UpstreamOptionHelp(values=values)
+            by_name[name] = entry
+            ensure_section().options.append((name, entry))
+
+    sections = [s for s in sections if s.options]
+    return HelpDoc(sections=sections, options=by_name)
