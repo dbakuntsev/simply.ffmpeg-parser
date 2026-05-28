@@ -52,6 +52,36 @@ class UpstreamOptionHelp:
     values: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class X264Section:
+    """A heading-grouped run of options from x264's ``--fullhelp`` output.
+
+    ``title`` is the section header text without its trailing colon
+    (e.g. ``"Presets"``, ``"Frame-type options"``, ``"Ratecontrol"``).
+    ``options`` lists ``(option_name, help)`` pairs in source order so
+    a doc renderer can emit options as the user reading the CLI help
+    would encounter them — preserving x264's curated grouping.
+    """
+
+    title: str
+    options: list[tuple[str, UpstreamOptionHelp]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class X264HelpDoc:
+    """Section-ordered view of the x264 help text plus a by-name index.
+
+    ``sections`` is what the doc renderer iterates over: each section's
+    options appear in the order x264.c emits them. ``options`` is the
+    flat lookup dict used by the extractor's option-overlay step (and
+    what the older :func:`parse_x264_help` returns directly). Both
+    views reference the same :class:`UpstreamOptionHelp` instances.
+    """
+
+    sections: list[X264Section] = field(default_factory=list)
+    options: dict[str, UpstreamOptionHelp] = field(default_factory=dict)
+
+
 _STRING_LITERAL = re.compile(r'"((?:\\.|[^"\\])*)"')
 _LINE_COMMENT = re.compile(r"//[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -85,6 +115,15 @@ _DEFINE = re.compile(
 _PARAM_ASSIGN = re.compile(
     r"param\s*->\s*([A-Za-z_][\w.]*)\s*=\s*([^;]+?)\s*;",
     re.DOTALL,
+)
+
+# Header of a string-name table: ``[static] const char * [const]
+# x264_<name>_names[] = {``. Both leading ``static`` and the second
+# ``const`` are optional in the wild. Captures the array's C symbol
+# name (group 1). The body is found by brace-matching after the match.
+_STRTABLE_HEAD = re.compile(
+    r"\b(?:static\s+)?const\s+char\s*\*\s*(?:const\s+)?"
+    r"([A-Za-z_]\w*)\s*\[\s*\]\s*=\s*\{"
 )
 
 # Pre-seeded "well-known" symbol values. ``BIT_DEPTH`` is a build-time
@@ -132,6 +171,20 @@ _VALUE_LINE = re.compile(r"^\s{30,40}-\s+([a-zA-Z][\w-]*)\s*(?:\(([^)]*)\))?\s*:
 # Continuation lines for a value: indented to col 37+. Anything less
 # indented is treated as the end of the value's description.
 _CONTINUATION = re.compile(r"^\s{36,}(\S.*?)\s*$")
+
+# Section header line in the help output — a capitalized title at column
+# 0 (no leading whitespace) followed by a colon, optionally with no other
+# punctuation. Examples in x264.c:
+#   ``Presets:``
+#   ``Frame-type options:``
+#   ``Ratecontrol:``
+#   ``Analysis:``
+#   ``Input/Output:``
+#   ``Filtering:``
+# The "Example usage:" line under the synopsis is also matched; the
+# parser tolerates it (it doesn't enclose any options, so it stays empty
+# and the renderer can drop empty sections).
+_SECTION_HEADER = re.compile(r"^([A-Z][A-Za-z][A-Za-z /\-]*?):\s*$")
 
 
 def _decode_escapes(s: str) -> str:
@@ -205,6 +258,7 @@ def _extract_help_text(
     c_source: str,
     defaults: dict[str, int | float | str | None] | None = None,
     constants: dict[str, int | float | str | None] | None = None,
+    string_tables: dict[str, list[str]] | None = None,
 ) -> str:
     """Return the user-visible help text as a single flat string.
 
@@ -266,7 +320,7 @@ def _extract_help_text(
         )
         if not fmt:
             continue
-        parts.append(_resolve_format(fmt, args, defaults, constants))
+        parts.append(_resolve_format(fmt, args, defaults, constants, string_tables))
 
     return "".join(parts)
 
@@ -510,10 +564,19 @@ def _parse_defaults(
 ) -> dict[str, int | float | str | None]:
     """Extract ``param->X.Y = EXPR;`` from ``x264_param_default()`` body.
 
-    Returns ``{"X.Y": value}`` for every assignment whose RHS can be
-    resolved using ``constants``. Unresolvable RHS values (function
-    calls, ternaries with unknown operands) are skipped — the help-text
-    resolver will leave their ``%d``/``%s`` placeholders intact.
+    Returns ``{"X.Y": value}`` for every assignment seen, with the
+    resolved value or ``None`` when the RHS can't be evaluated (function
+    calls, ternaries with unknown operands, etc.). The distinction
+    between "mentioned but inevaluable" and "not mentioned at all" is
+    semantically meaningful at the resolution layer:
+
+    - Mentioned + evaluable → real default value.
+    - Mentioned + ``None`` → genuinely runtime-determined; the printf
+      placeholder stays literal.
+    - **Absent from the dict** → x264 relies on the function-entry
+      ``memset(param, 0, sizeof(x264_param_t))`` to zero the field.
+      :func:`_resolve_format` substitutes zero of the placeholder's
+      type (``0`` for ``%d``, ``0.0`` for ``%f``, ``""`` for ``%s``).
     """
     if not base_c_text:
         return {}
@@ -564,29 +627,194 @@ def _parse_defaults(
             out[path] = sm.group(1)
             continue
         py_expr = _to_python_expr(rhs, {}, constants)
-        if py_expr is None:
-            continue
-        val = _safe_eval(py_expr)
-        if val is None:
-            continue
+        val = None if py_expr is None else _safe_eval(py_expr)
+        # ``None`` is recorded too — it means "x264 explicitly sets this
+        # field, but to something we can't evaluate" (runtime call,
+        # ternary on an unknown). The resolver treats that differently
+        # from a field absent from the dict (memset-zeroed).
         out[path] = val
     return out
+
+
+def _parse_string_tables(*sources: str) -> dict[str, list[str]]:
+    """Extract ``[static] const char * [const] NAME[] = { "s1", …, 0 };``
+    arrays from one or more sources.
+
+    Returns ``{NAME: [s1, s2, …]}`` — the terminating ``0`` / ``NULL``
+    sentinel is dropped naturally (we collect only string literals from
+    the body). Used to resolve ``strtable_lookup(NAME, defaults->X)``
+    references in the help text: the integer default of ``X`` becomes
+    the index into the returned list.
+
+    The tables live in both ``x264.h`` (most enum-name tables) and
+    ``x264.c`` (a handful like ``x264_cqm_names``, ``x264_pulldown_names``),
+    so callers pass both sources concatenated.
+    """
+    out: dict[str, list[str]] = {}
+    for source in sources:
+        if not source:
+            continue
+        cleaned = _BLOCK_COMMENT.sub(" ", source)
+        cleaned = _LINE_COMMENT.sub("", cleaned)
+        for m in _STRTABLE_HEAD.finditer(cleaned):
+            name = m.group(1)
+            if name in out:
+                continue  # first-wins so a later partial declaration can't shadow
+            open_brace = cleaned.find("{", m.end() - 1)
+            if open_brace == -1:
+                continue
+            # Walk to matching close brace, honoring string literals so a
+            # ``{`` inside ``"..."`` doesn't perturb the depth.
+            depth = 0
+            i = open_brace
+            n = len(cleaned)
+            while i < n:
+                ch = cleaned[i]
+                if ch == '"':
+                    i += 1
+                    while i < n and cleaned[i] != '"':
+                        if cleaned[i] == "\\" and i + 1 < n:
+                            i += 2
+                            continue
+                        i += 1
+                    i += 1
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        body = cleaned[open_brace + 1 : i]
+                        out[name] = [
+                            _decode_escapes(sm.group(1))
+                            for sm in _STRING_LITERAL.finditer(body)
+                        ]
+                        break
+                i += 1
+    return out
+
+
+# Sentinel value returned by :func:`_resolve_arg_value` when a
+# ``defaults->X`` reference points at a struct field that
+# ``x264_param_default()`` never explicitly assigns. C-struct semantics
+# guarantee such a field has been zeroed by the function-entry
+# ``memset(param, 0, sizeof(x264_param_t))``, so the resolver
+# substitutes zero of the printf placeholder's type (``0`` for ``%d``,
+# ``0.0`` for ``%f``, ``""`` for ``%s``). Distinct from ``None``, which
+# means "field IS assigned but the RHS expression is runtime-determined
+# (e.g. ``x264_cpu_detect()``)" — those stay literal in the rendered
+# help text.
+class _MemsetDefault:
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover — purely for debugging
+        return "<MEMSET_DEFAULT>"
+
+
+_MEMSET_DEFAULT = _MemsetDefault()
 
 
 def _resolve_arg_value(
     arg: str,
     defaults: dict[str, int | float | str | None],
     constants: dict[str, int | float | str | None],
+    string_tables: dict[str, list[str]] | None = None,
 ) -> object | None:
-    """Try to evaluate one printf argument. Returns ``None`` when
-    unresolvable so the caller can leave the placeholder intact."""
+    """Try to evaluate one printf argument.
+
+    Return values carry three-way information:
+
+    - Resolved value (int, float, str) → use directly.
+    - ``None`` → arg references a runtime-determined value (or is an
+      expression we can't simplify); leave the placeholder literal.
+    - :data:`_MEMSET_DEFAULT` → arg references a struct field that
+      ``x264_param_default()`` left untouched, so it inherits zero from
+      the function-entry memset. :func:`_resolve_format` substitutes
+      zero of the format spec's type.
+    """
     arg = arg.strip()
     if not arg:
         return None
-    # Direct ``defaults->X.Y`` access (no further math).
-    m = re.fullmatch(r"defaults\s*->\s*([\w.]+)", arg)
+    tables = string_tables or {}
+
+    # ``strtable_lookup( table_name, defaults->X )`` — x264 emits this
+    # in many ``%s`` printf args to translate an integer enum value to
+    # the human-readable name. Resolve it by combining a parsed name
+    # table (group 1) with the integer default of the indexed field
+    # (group 2). Memset-zeroed indices land at table[0], which is the
+    # right answer in every case x264 follows the convention "enum
+    # value 0 is the documented default".
+    sm = re.fullmatch(
+        r"strtable_lookup\s*\(\s*(\w+)\s*,\s*defaults\s*->\s*([\w.]+)\s*\)",
+        arg,
+    )
+    if sm:
+        table_name = sm.group(1)
+        path = sm.group(2)
+        table = tables.get(table_name)
+        if table is None:
+            return None
+        if path in defaults:
+            idx_val = defaults[path]
+        else:
+            idx_val = 0  # memset-zeroed → index 0
+        if not isinstance(idx_val, int):
+            return None
+        if 0 <= idx_val < len(table):
+            return table[idx_val]
+        # Out-of-range index — matches x264's own ``strtable_lookup()``
+        # which prints ``"???"`` rather than crashing. Happens when the
+        # field's default is a sentinel like ``-1`` meaning "depends on
+        # input" (e.g. ``vui.i_colmatrix``).
+        return "???"
+
+    # ``stringify_names( buf, table_name )`` — x264's helper for
+    # rendering an entire name table as ``"a, b, c"`` (the ``buf``
+    # parameter is just a scratch buffer the helper writes into).
+    # Resolve by joining the table's entries.
+    sm = re.fullmatch(
+        r"stringify_names\s*\(\s*\w+\s*,\s*(\w+)\s*\)",
+        arg,
+    )
+    if sm:
+        table = tables.get(sm.group(1))
+        return ", ".join(table) if table is not None else None
+
+    # ``table_name[N]`` — direct indexing of a name table by a literal
+    # integer. x264 uses ``x264_muxer_names[0]`` etc. to surface the
+    # first/default entry of a table in the help header.
+    sm = re.fullmatch(r"(\w+)\s*\[\s*(\d+)\s*\]", arg)
+    if sm:
+        table = tables.get(sm.group(1))
+        if table is not None:
+            idx = int(sm.group(2))
+            if 0 <= idx < len(table):
+                return table[idx]
+
+    # Direct ``defaults->X.Y`` or ``defaults->X.Y[N]`` access. Array
+    # indexing matters for fields like ``analyse.i_luma_deadzone[0]``
+    # — the regex only captures the path up to (but not including) the
+    # bracket; the index is captured separately. When the path is
+    # present in defaults and its value is a list/tuple, return the
+    # indexed element; otherwise fall through to the memset-default
+    # logic (array fields x264 never explicitly assigns are zeroed
+    # just like scalars).
+    m = re.fullmatch(r"defaults\s*->\s*([\w.]+)(?:\[(\d+)\])?", arg)
     if m:
-        return defaults.get(m.group(1))
+        path = m.group(1)
+        index_str = m.group(2)
+        if path in defaults:
+            value = defaults[path]
+            if index_str is not None and isinstance(value, (list, tuple)):
+                idx = int(index_str)
+                if 0 <= idx < len(value):
+                    return value[idx]
+                return _MEMSET_DEFAULT
+            # Either a resolved value or None (mentioned-but-inevaluable).
+            return value
+        # Not mentioned in x264_param_default() → memset-zeroed at
+        # function entry; surface that distinction to the caller.
+        return _MEMSET_DEFAULT
     # Bare numeric literal.
     if re.fullmatch(r"-?\d+", arg):
         return int(arg)
@@ -606,11 +834,30 @@ def _resolve_arg_value(
     return _safe_eval(py_expr)
 
 
+def _zero_for_spec(spec: str) -> int | float | str:
+    """The "C zero" for a printf conversion specifier.
+
+    ``memset(0)`` of a struct gives every field its type-appropriate
+    zero — an int field reads as ``0``, a float reads as ``0.0``, a
+    ``char *`` reads as ``NULL`` (which ``printf("%s", NULL)`` renders
+    as ``"(null)"`` in glibc but as the empty string in many other
+    libcs; we go with empty string as the more readable choice).
+    """
+    last = spec[-1]
+    if last in "fFeEgG":
+        return 0.0
+    if last in "sc":
+        return ""
+    # diouxX and anything else → integer 0.
+    return 0
+
+
 def _resolve_format(
     fmt: str,
     args: list[str],
     defaults: dict[str, int | float | str | None],
     constants: dict[str, int | float | str | None],
+    string_tables: dict[str, list[str]] | None = None,
 ) -> str:
     """Walk ``fmt``, substituting each ``%X`` specifier with the
     formatted value of the matching ``args`` entry. Unresolved args
@@ -630,12 +877,17 @@ def _resolve_format(
             if m:
                 spec = m.group(0)
                 value = (
-                    _resolve_arg_value(args[arg_idx], defaults, constants)
+                    _resolve_arg_value(
+                        args[arg_idx], defaults, constants, string_tables
+                    )
                     if arg_idx < len(args)
                     else None
                 )
                 if arg_idx < len(args):
                     arg_idx += 1
+                # Memset-default: substitute zero of the spec's type.
+                if value is _MEMSET_DEFAULT:
+                    value = _zero_for_spec(spec)
                 if value is not None:
                     try:
                         out.append(spec % value)
@@ -650,49 +902,59 @@ def _resolve_format(
     return "".join(out)
 
 
-def parse_x264_help(
+def parse_x264_doc(
     c_source: str,
     *,
     base_c: str = "",
     common_h: str = "",
     x264_h: str = "",
-) -> dict[str, UpstreamOptionHelp]:
-    """Return ``{long_option_name: UpstreamOptionHelp}`` for every
-    ``--<opt>`` declared in the help text.
+) -> X264HelpDoc:
+    """Parse x264's help text into a section-ordered doc structure.
 
-    Each entry carries the option's own header description (always
-    present when the header parses) plus a value list for the few
-    options that emit one (``--preset``, ``--tune``, ``--profile``).
+    The returned :class:`X264HelpDoc` carries both an ordered list of
+    sections (each with its options in source order, for doc rendering)
+    and a flat by-name index (for the extractor's option-overlay step).
+    Both views share the same :class:`UpstreamOptionHelp` instances.
 
-    The extractor matches FFmpeg libx264 options against this map by
-    bare name (option ``-crf`` looks up key ``"crf"``), so a richer
-    upstream description automatically reaches every libx264 option
-    whose name happens to coincide with x264's CLI option spelling —
-    no hardcoded mapping table required.
-
-    When the optional auxiliary sources are supplied, printf-style
-    placeholders in the help text are resolved against ``#define``
-    constants (from the headers) and ``x264_param_default()`` field
-    initializers (from ``common/base.c``). So ``Force constant QP
-    (0-%d, 0=lossless)`` becomes ``Force constant QP (0-69, 0=lossless)``
-    (with ``BIT_DEPTH=8``, the default ``QP_MAX`` works out to 69).
-    Placeholders whose arguments don't resolve (function calls,
-    ternaries with unknown operands) stay literal.
+    ``base_c`` / ``common_h`` / ``x264_h`` are optional auxiliary sources
+    consulted for placeholder resolution — see :func:`parse_x264_help`.
     """
     constants = _parse_constants(common_h + "\n\n" + x264_h)
     defaults = _parse_defaults(base_c, constants)
+    # Name tables can live in either x264.h (most enum-name tables) or
+    # x264.c (a handful — cqm, pulldown, range, …). Walk both.
+    string_tables = _parse_string_tables(c_source, x264_h)
 
-    flat = _extract_help_text(c_source, defaults=defaults, constants=constants)
+    flat = _extract_help_text(
+        c_source,
+        defaults=defaults,
+        constants=constants,
+        string_tables=string_tables,
+    )
     if not flat:
-        return {}
+        return X264HelpDoc()
 
-    results: dict[str, UpstreamOptionHelp] = {}
+    sections: list[X264Section] = []
+    by_name: dict[str, UpstreamOptionHelp] = {}
+
+    # Per-option parsing state.
+    current_section: X264Section | None = None
     current_option: str | None = None
     current_desc_lines: list[str] = []
     current_value: str | None = None
     current_value_lines: list[str] = []
     pending_values: list[tuple[str, str]] = []
     in_value_block = False  # True after a ``- name:`` line has been seen
+
+    def ensure_section() -> X264Section:
+        """Return the current section, creating an unnamed catch-all for
+        options that appear before the first section header (rare —
+        usually the synopsis block)."""
+        nonlocal current_section
+        if current_section is None:
+            current_section = X264Section(title="General", options=[])
+            sections.append(current_section)
+        return current_section
 
     def flush_value() -> None:
         nonlocal current_value, current_value_lines
@@ -709,17 +971,31 @@ def parse_x264_help(
             # Don't overwrite a richer earlier entry. The help text never
             # repeats option headers in practice, but the guard keeps
             # behavior stable if a future x264 reorganization changes that.
-            if current_option not in results and (description or pending_values):
-                results[current_option] = UpstreamOptionHelp(
+            if current_option not in by_name and (description or pending_values):
+                entry = UpstreamOptionHelp(
                     description=description,
                     values=list(pending_values),
                 )
+                by_name[current_option] = entry
+                ensure_section().options.append((current_option, entry))
         current_option = None
         current_desc_lines = []
         pending_values = []
         in_value_block = False
 
     for line in flat.split("\n"):
+        # Section header — Capitalized text + colon at column 0. Must
+        # match BEFORE the option-header check so a section heading
+        # isn't misread as an option (the option-header regex also
+        # tolerates col 0, though that combo is unusual in practice).
+        sec_match = _SECTION_HEADER.match(line)
+        if sec_match:
+            flush_value()
+            flush_option()
+            current_section = X264Section(title=sec_match.group(1), options=[])
+            sections.append(current_section)
+            continue
+
         opt_match = _OPTION_HEADER.match(line)
         if opt_match:
             flush_value()
@@ -764,7 +1040,47 @@ def parse_x264_help(
 
     flush_value()
     flush_option()
-    return results
+
+    # Drop sections that ended up with no options (e.g. "Example usage").
+    sections = [s for s in sections if s.options]
+    return X264HelpDoc(sections=sections, options=by_name)
+
+
+def parse_x264_help(
+    c_source: str,
+    *,
+    base_c: str = "",
+    common_h: str = "",
+    x264_h: str = "",
+) -> dict[str, UpstreamOptionHelp]:
+    """Return ``{long_option_name: UpstreamOptionHelp}`` for every
+    ``--<opt>`` declared in the help text.
+
+    Each entry carries the option's own header description (always
+    present when the header parses) plus a value list for the few
+    options that emit one (``--preset``, ``--tune``, ``--profile``).
+
+    The extractor matches FFmpeg libx264 options against this map by
+    bare name (option ``-crf`` looks up key ``"crf"``), so a richer
+    upstream description automatically reaches every libx264 option
+    whose name happens to coincide with x264's CLI option spelling —
+    no hardcoded mapping table required.
+
+    When the optional auxiliary sources are supplied, printf-style
+    placeholders in the help text are resolved against ``#define``
+    constants (from the headers) and ``x264_param_default()`` field
+    initializers (from ``common/base.c``). So ``Force constant QP
+    (0-%d, 0=lossless)`` becomes ``Force constant QP (0-69, 0=lossless)``
+    (with ``BIT_DEPTH=8``, the default ``QP_MAX`` works out to 69).
+    Placeholders whose arguments don't resolve (function calls,
+    ternaries with unknown operands) stay literal.
+
+    Thin wrapper over :func:`parse_x264_doc`, which is the richer
+    section-aware parser used by the HTML doc renderer.
+    """
+    return parse_x264_doc(
+        c_source, base_c=base_c, common_h=common_h, x264_h=x264_h
+    ).options
 
 
 def parse_x264_help_file(path: Path) -> dict[str, list[tuple[str, str]]]:

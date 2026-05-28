@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import multiprocessing
+import os
 import re
 import shutil
 import subprocess
@@ -29,7 +31,8 @@ from .git_utils import (
     temporary_worktree,
 )
 from .models import AVOptionEntry, ExtractConfig
-from .x264_help import UpstreamOptionHelp, parse_x264_help
+from .x264_doc import render_x264_doc
+from .x264_help import UpstreamOptionHelp, X264HelpDoc, parse_x264_doc
 from .x265_help import parse_x265_help
 
 # Pre-compiled regex matching x265's stable release tags only — pre-release
@@ -77,13 +80,42 @@ _VENDORED_T2H = "t2h.pm"
 # mid-line, rendered as ``♪◙`` by CP437-savvy terminals.)
 _print_lock = None
 
+# Cross-process lock that serializes the x264 reference HTML emit phase.
+# Two FFmpeg tags often pin the same x264 commit (e.g. n8.1 and n8.1.1
+# both → 0480cb05fa18) and without this lock both workers would race to
+# write ``doc/x264/<commit12>/x264-reference.html``. Held only during the
+# render+write inside :func:`_emit_x264_doc`, with a check-existing-file
+# fast path so the second worker reuses the first's output for free.
+_x264_lock = None
 
-def _pool_initializer(lock) -> None:
+# Per-worker parse cache for ``X264HelpDoc``. Module-level so it persists
+# across multiple tags handled by the same worker process. With
+# ``ProcessPoolExecutor``, each worker has its own copy — cross-worker
+# parse reuse would need a Manager, not worth the complexity for ~50ms
+# of parse work. The on-disk cache (file existence check) already
+# captures the cross-worker overlap.
+_x264_parse_cache: "dict[str, object]" = {}
+
+# Per-worker memo of commits this worker has already emitted (or
+# confirmed exist on disk). Lets the second tag pinning the same commit
+# skip even the lock acquisition + file-stat round-trip.
+_x264_emit_cache: "set[str]" = set()
+
+
+def _pool_initializer(print_lock, x264_lock) -> None:
     """Runs once per worker process at pool start-up. Stashes the shared
-    lock in the module-level slot so every Logger instance in this worker
-    serializes its writes through it."""
-    global _print_lock
-    _print_lock = lock
+    locks in module-level slots so every Logger emit and every x264 doc
+    write in this worker uses them."""
+    global _print_lock, _x264_lock
+    _print_lock = print_lock
+    _x264_lock = x264_lock
+
+
+def _x264_emit_context():
+    """Context manager that wraps the x264 emit phase with the shared
+    cross-process lock when one is installed (parallel mode), or with
+    a no-op otherwise (sequential mode — no race possible)."""
+    return _x264_lock if _x264_lock is not None else contextlib.nullcontext()
 
 
 def _write_line(stream: str, line: str) -> None:
@@ -710,7 +742,13 @@ def _write_json(path: Path, payload: dict | list) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _build_index(version: str, released: str | None, categories: set[str]) -> dict:
+def _build_index(
+    version: str,
+    released: str | None,
+    categories: set[str],
+    *,
+    x264_doc: str = "",
+) -> dict:
     index: dict = {
         "version": version,
         "released": released or "",
@@ -732,6 +770,13 @@ def _build_index(version: str, released: str | None, categories: set[str]) -> di
         index["protocols"] = "protocols.json"
     if "bitstream_filters" in categories:
         index["bitstream_filters"] = "bitstream_filters.json"
+    # Path is relative to the SPA's public root (``web/public/``), not
+    # to this index.json's directory — the file lives in a sibling tree
+    # (``doc/x264/<commit>/``) keyed on x264 commit so multiple FFmpeg
+    # versions pinning the same x264 commit share one rendered file.
+    # Absent when --x264-repo wasn't supplied for this run.
+    if x264_doc:
+        index["x264_doc"] = x264_doc
     return index
 
 
@@ -803,7 +848,14 @@ def _extract_and_write(
         # commit date is the only signal we have. Parsing is cheap
         # (~5ms); we just re-parse per tag rather than thread a shared
         # map through the worker pool.
+        #
+        # ``x264_doc_path`` is the relative web path of the per-commit
+        # x264 HTML reference (when rendered). It surfaces in this tag's
+        # ``index.json`` so the SPA can deep-link from libx264 options
+        # to ``#option-<name>``. Stays empty when --x264-repo wasn't
+        # supplied or the commit's help text didn't parse.
         x264_help: dict[str, UpstreamOptionHelp] = {}
+        x264_doc_path: str = ""
         if config.x264_repo is not None:
             if not released:
                 logger.warn(
@@ -817,34 +869,52 @@ def _extract_and_write(
                         f"{released}"
                     )
                 else:
-                    x264_c_text = show_file(config.x264_repo, commit, "x264.c")
+                    # Per-worker parse cache — when this worker has
+                    # already handled another tag pinning the same x264
+                    # commit, skip every file fetch and the parser run.
+                    cached_doc = _x264_parse_cache.get(commit)
+                    if cached_doc is not None:
+                        x264_doc_struct = cached_doc  # type: ignore[assignment]
+                        x264_c_text = "(cached)"
+                        logger.debug(
+                            f"x264 cache hit for commit {commit[:12]}"
+                        )
+                    else:
+                        x264_c_text = show_file(
+                            config.x264_repo, commit, "x264.c"
+                        )
+
                     if x264_c_text is None:
                         logger.warn(
                             f"x264 enrichment skipped: x264.c not found at "
                             f"commit {commit[:12]}"
                         )
                     else:
-                        # Optional auxiliary sources so the parser can
-                        # resolve printf-style placeholders (``%d``,
-                        # ``%.1f``, …) in the descriptions to actual
-                        # constants and default values. Each is
-                        # best-effort: missing → that resolution path
-                        # is just skipped, the rest still works.
-                        base_c = show_file(
-                            config.x264_repo, commit, "common/base.c"
-                        ) or ""
-                        common_h = show_file(
-                            config.x264_repo, commit, "common/common.h"
-                        ) or ""
-                        x264_h = show_file(
-                            config.x264_repo, commit, "x264.h"
-                        ) or ""
-                        x264_help = parse_x264_help(
-                            x264_c_text,
-                            base_c=base_c,
-                            common_h=common_h,
-                            x264_h=x264_h,
-                        )
+                        if cached_doc is None:
+                            # Optional auxiliary sources so the parser
+                            # can resolve printf-style placeholders
+                            # (``%d``, ``%.1f``, …) in the descriptions
+                            # to actual constants and default values.
+                            # Each is best-effort: missing → that
+                            # resolution path is just skipped, the rest
+                            # still works.
+                            base_c = show_file(
+                                config.x264_repo, commit, "common/base.c"
+                            ) or ""
+                            common_h = show_file(
+                                config.x264_repo, commit, "common/common.h"
+                            ) or ""
+                            x264_h = show_file(
+                                config.x264_repo, commit, "x264.h"
+                            ) or ""
+                            x264_doc_struct = parse_x264_doc(
+                                x264_c_text,
+                                base_c=base_c,
+                                common_h=common_h,
+                                x264_h=x264_h,
+                            )
+                            _x264_parse_cache[commit] = x264_doc_struct
+                        x264_help = x264_doc_struct.options
                         if x264_help:
                             with_values = sum(1 for v in x264_help.values() if v.values)
                             with_desc = sum(1 for v in x264_help.values() if v.description)
@@ -853,6 +923,15 @@ def _extract_and_write(
                                 f"(<= {released}): {len(x264_help)} options "
                                 f"({with_values} with value lists, "
                                 f"{with_desc} with descriptions)"
+                            )
+                            # Render the standalone HTML reference and
+                            # record the per-version pointer that the
+                            # SPA / index.json regenerator pick up.
+                            x264_doc_path = _emit_x264_doc(
+                                config.out,
+                                commit,
+                                x264_doc_struct,
+                                logger,
                             )
                         else:
                             logger.warn(
@@ -973,7 +1052,9 @@ def _extract_and_write(
                 doc_root, config.out, target_version, makeinfo_cmd, logger
             )
 
-    index = _build_index(target_version, released, config.categories)
+    index = _build_index(
+        target_version, released, config.categories, x264_doc=x264_doc_path
+    )
     _write_json(output_dir / "index.json", index)
 
 
@@ -1023,6 +1104,70 @@ def _ensure_shared_assets(doc_root_out: Path) -> None:
         if dst.exists() and dst.stat().st_size == src.stat().st_size:
             continue
         shutil.copyfile(src, dst)
+
+
+def _emit_x264_doc(
+    out_root: Path,
+    commit: str,
+    doc: X264HelpDoc,
+    logger: Logger,
+) -> str:
+    """Render the x264 reference page for ``commit`` into
+    ``<out_root>/doc/x264/<commit12>/x264-reference.html`` and return
+    its web-relative path (``doc/x264/<commit12>/x264-reference.html``)
+    for inclusion in the per-version ``index.json``.
+
+    Keyed on the commit SHA, so several FFmpeg tags that pin the same
+    x264 commit share one rendered file. Thread-safety is layered:
+
+    1. **Per-worker memo** (:data:`_x264_emit_cache`) — if this worker
+       has already emitted or confirmed this commit, return immediately
+       without touching the filesystem.
+    2. **Cross-process lock** (:data:`_x264_lock`) — held across the
+       render+write phase so concurrent workers handling tags pinned to
+       the same commit don't both do the work. A ``nullcontext`` stands
+       in for sequential mode where no race can occur.
+    3. **File-exists fast path** inside the lock — the second worker
+       (or a re-run picking up a prior run's output) skips the parse
+       result it already has and just returns the path.
+    4. **PID-suffixed tmp name** — defense in depth: even if the
+       cross-process lock were somehow circumvented, no two workers
+       compute the same ``.tmp`` filename, so a ``write_text`` call
+       can't collide with a peer.
+    """
+    commit12 = commit[:12]
+    relative = f"doc/x264/{commit12}/x264-reference.html"
+
+    if commit in _x264_emit_cache:
+        return relative
+
+    page_dir = out_root / "doc" / "x264" / commit12
+    page_path = page_dir / "x264-reference.html"
+
+    with _x264_emit_context():
+        if page_path.exists():
+            # Another worker already rendered this commit (or a
+            # previous run did). Skip the redundant parse/render/write.
+            _x264_emit_cache.add(commit)
+            return relative
+
+        # Ensure the shared CSS that the page references exists. Cheap.
+        _ensure_shared_assets(out_root / "doc" / "ffmpeg")
+
+        html = render_x264_doc(doc, x264_commit=commit)
+        page_dir.mkdir(parents=True, exist_ok=True)
+        # PID-suffixed tmp file: two workers under the same lock would
+        # serialize naturally, but the suffix means even an unlocked
+        # path (e.g. future caller forgetting the lock) can't tear
+        # writes. ``os.replace`` is atomic on both POSIX and Windows.
+        tmp_path = page_path.with_name(
+            f"{page_path.name}.{os.getpid()}.tmp"
+        )
+        tmp_path.write_text(html, encoding="utf-8")
+        tmp_path.replace(page_path)
+        _x264_emit_cache.add(commit)
+        logger.debug(f"Rendered x264 reference -> {relative}")
+    return relative
 
 
 def run_extraction(config: ExtractConfig) -> int:
@@ -1083,11 +1228,12 @@ def run_extraction(config: ExtractConfig) -> int:
         # work done than necessary in the failure case.
         mp_ctx = multiprocessing.get_context()
         print_lock = mp_ctx.Lock()
+        x264_lock = mp_ctx.Lock()
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=worker_count,
             mp_context=mp_ctx,
             initializer=_pool_initializer,
-            initargs=(print_lock,),
+            initargs=(print_lock, x264_lock),
         ) as pool:
             future_to_tag = {
                 pool.submit(_extract_for_tag_pooled, config, tag, makeinfo_cmd): tag

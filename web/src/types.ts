@@ -102,6 +102,13 @@ export interface MetadataIndex {
   muxers?: string;
   protocols?: string;
   bitstream_filters?: string;
+  /** Web-relative path to the standalone x264 reference HTML, keyed
+   * per x264 commit so multiple FFmpeg versions pinning the same x264
+   * commit share one rendered file. Example:
+   * ``"doc/x264/0480cb05fa18/x264-reference.html"``. Absent when the
+   * extractor wasn't run with ``--x264-repo``. The SPA's inspector
+   * uses this to deep-link from libx264 options to ``#option-<name>``. */
+  x264_doc?: string;
 }
 
 export interface OptionsMetadata {

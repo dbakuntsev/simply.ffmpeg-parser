@@ -378,7 +378,26 @@ function buildOptionSelection(
   if (enrichment) description.push(...enrichment.paragraphs);
 
   const title = optionInfo?.name ?? explanation?.title ?? flag;
-  const extraDocs = enrichment?.docLink ? [enrichment.docLink] : undefined;
+  const extraDocs: SelectionDocLink[] = [];
+  if (enrichment?.docLink) extraDocs.push(enrichment.docLink);
+
+  // x264 reference link — surfaces only when the resolver attributed
+  // this option to a libx264-family codec AND the bundle advertises a
+  // rendered x264 reference page. The page's per-option anchors come
+  // from the same bare names we use elsewhere ( ``crf`` from ``-crf`` ),
+  // so the deep link works without any further coordination.
+  const x264DocPath = metadata.index?.x264_doc;
+  if (
+    x264DocPath &&
+    binding.resolutionSource === "codec-private" &&
+    binding.matchedCodec &&
+    /^libx264/.test(binding.matchedCodec)
+  ) {
+    extraDocs.push({
+      label: "x264 reference",
+      url: `./${x264DocPath}#option-${encodeURIComponent(base.slice(1))}`,
+    });
+  }
 
   // Surface the option's documented values (e.g. ``-fflags`` flag names,
   // ``-nal-hrd`` enum tokens) paired with their C-source help text where
@@ -399,7 +418,7 @@ function buildOptionSelection(
     description,
     values: valueRows,
     docsUrl: docsUrlForOption(version, optionInfo, docTokens),
-    extraDocs,
+    extraDocs: extraDocs.length ? extraDocs : undefined,
   };
 }
 
