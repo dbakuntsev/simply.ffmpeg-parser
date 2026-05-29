@@ -11,6 +11,7 @@ import { useSelection } from "./hooks/useSelection";
 import { analyzeCommand, buildPipelineModel, buildTreeNodes } from "./parser";
 import { buildSelectionInfo } from "./selection";
 import { buildSourceRanges } from "./sourceRanges";
+import { scrollSelectionIntoView } from "./textareaCaret";
 import type { Issue } from "./types";
 
 const SAMPLE = `ffmpeg -i input.mp4 -vf "scale=1280:-1" -c:v libx264 -c:a aac output.mp4`;
@@ -69,6 +70,9 @@ export default function App() {
     if (!range) return;
     el.focus();
     el.setSelectionRange(range.start, range.end);
+    // Scroll the textarea's content so the highlighted span is visible (the
+    // command may be long enough to scroll). setSelectionRange doesn't do this.
+    scrollSelectionIntoView(el, range.start);
   }, [selectedNode, sourceRanges, submitted]);
 
   const handleIssueClick = (issue: Issue) => {
