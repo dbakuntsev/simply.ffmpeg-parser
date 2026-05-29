@@ -10,6 +10,7 @@ import { useMetadata } from "./hooks/useMetadata";
 import { useSelection } from "./hooks/useSelection";
 import { analyzeCommand, buildPipelineModel, buildTreeNodes } from "./parser";
 import { buildSelectionInfo } from "./selection";
+import { buildSourceRanges } from "./sourceRanges";
 import type { Issue } from "./types";
 
 const SAMPLE = `ffmpeg -i input.mp4 -vf "scale=1280:-1" -c:v libx264 -c:a aac output.mp4`;
@@ -48,6 +49,27 @@ export default function App() {
     [analysis, metadata, version, versionTokens]
   );
   const selection = selectedNode ? selectionInfo.get(selectedNode) ?? null : null;
+
+  // Map node ids → command text spans so selecting a chart/tree node highlights
+  // the matching text in the textarea.
+  const sourceRanges = useMemo(
+    () => (analysis ? buildSourceRanges(submitted, analysis) : new Map()),
+    [analysis, submitted]
+  );
+
+  useEffect(() => {
+    if (!selectedNode) return;
+    const el = textareaRef.current;
+    if (!el) return;
+    // Ranges are computed against the analyzed command; skip if the textarea has
+    // since been edited (debounce not yet flushed) to avoid highlighting stale
+    // offsets.
+    if (el.value !== submitted) return;
+    const range = sourceRanges.get(selectedNode);
+    if (!range) return;
+    el.focus();
+    el.setSelectionRange(range.start, range.end);
+  }, [selectedNode, sourceRanges, submitted]);
 
   const handleIssueClick = (issue: Issue) => {
     if (!analysis || !textareaRef.current) return;

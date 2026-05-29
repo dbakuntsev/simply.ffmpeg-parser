@@ -55,9 +55,14 @@ export function SelectionPanel({ selection, onClose }: Props) {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
+  // Only pull focus into the panel in modal (mobile) mode, where it's an
+  // aria-modal dialog and moving focus inside is expected. In drawer (lg) mode
+  // the panel is a non-modal complementary region that coexists with the page,
+  // so we leave focus on the command textarea — App highlights the selected
+  // node's text there, and a textarea selection is only visible while focused.
   useEffect(() => {
-    closeButtonRef.current?.focus();
-  }, []);
+    if (!isLg) closeButtonRef.current?.focus();
+  }, [isLg]);
 
   const hasFields = !!(selection.fields && selection.fields.length > 0);
   const hasDescription = !!(selection.description && selection.description.length > 0);

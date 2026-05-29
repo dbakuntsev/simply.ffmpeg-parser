@@ -1,4 +1,4 @@
-import type { MetadataBundle, OptionBinding, SemanticCommand, Token } from "../types";
+import type { FilterGraph, MetadataBundle, OptionBinding, SemanticCommand, Token } from "../types";
 import { parseFilterComplex } from "./filters";
 import { nextBindingId } from "./ids";
 import { ResolvedOption, shouldExpectValue } from "./resolver";
@@ -12,19 +12,9 @@ export function buildSemantic(
   const globals: OptionBinding[] = [];
   const inputs: OptionBinding[] = [];
   const outputs: OptionBinding[] = [];
-  const inputNodes: { id: string; source: string; options: OptionBinding[] }[] = [];
-  const outputNodes: { id: string; target: string; options: OptionBinding[] }[] = [];
-  const filterGraphs: {
-    id: string;
-    expression: string;
-    chains?: {
-      id: string;
-      label: string;
-      filters: { name: string; args: { key: string; value: string }[] }[];
-      inputPads?: string[];
-      outputPads?: string[];
-    }[];
-  }[] = [];
+  const inputNodes: { id: string; source: string; options: OptionBinding[]; tokenId?: string }[] = [];
+  const outputNodes: { id: string; target: string; options: OptionBinding[]; tokenId?: string }[] = [];
+  const filterGraphs: FilterGraph[] = [];
 
   let inputIndex = -1;
   let outputIndex = -1;
@@ -46,18 +36,18 @@ export function buildSemantic(
     outputs.push(binding);
   };
 
-  const assignPendingToInput = (source: string) => {
+  const assignPendingToInput = (source: string, tokenId?: string) => {
     inputIndex += 1;
-    inputNodes.push({ id: `input_${inputIndex}`, source, options: [] });
+    inputNodes.push({ id: `input_${inputIndex}`, source, options: [], tokenId });
     for (const opt of pendingInputs) {
       attachToInput(opt, inputIndex);
     }
     pendingInputs = [];
   };
 
-  const assignPendingToOutput = (target: string) => {
+  const assignPendingToOutput = (target: string, tokenId?: string) => {
     outputIndex += 1;
-    outputNodes.push({ id: `output_${outputIndex}`, target, options: [] });
+    outputNodes.push({ id: `output_${outputIndex}`, target, options: [], tokenId });
     for (const opt of pendingOutputs) {
       attachToOutput(opt, outputIndex);
     }
@@ -76,7 +66,7 @@ export function buildSemantic(
       const value = tokens[i + 1];
       if (value) {
         value.type = "input";
-        assignPendingToInput(value.text);
+        assignPendingToInput(value.text, value.id);
         i += 2;
         continue;
       }
@@ -110,7 +100,7 @@ export function buildSemantic(
           token.normalizedText === "-filter_complex"
         ) {
           const chains = token.normalizedText === "-filter_complex" ? parseFilterComplex(value.text) : undefined;
-          filterGraphs.push({ id: `filter_${filterGraphs.length}`, expression: value.text, chains });
+          filterGraphs.push({ id: `filter_${filterGraphs.length}`, expression: value.text, chains, valueTokenId: value.id });
           value.type = "filter";
         }
         i += 2;
@@ -158,7 +148,7 @@ export function buildSemantic(
     }
 
     if (token.type === "value") {
-      assignPendingToOutput(token.text);
+      assignPendingToOutput(token.text, token.id);
       token.type = "output";
       i += 1;
       continue;

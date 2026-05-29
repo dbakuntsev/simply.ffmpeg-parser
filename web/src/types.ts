@@ -40,22 +40,40 @@ export interface InputNode {
   id: string;
   source: string;
   options: OptionBinding[];
+  /** Token id of the source filename/URL (the value after ``-i``), used to
+   * highlight it in the command input when the input is selected. */
+  tokenId?: string;
 }
 
 export interface OutputNode {
   id: string;
   target: string;
   options: OptionBinding[];
+  /** Token id of the output target, used to highlight it in the command input. */
+  tokenId?: string;
+}
+
+/** Character offsets within the ``-filter_complex`` / ``-vf`` / ``-af``
+ * expression string (i.e. relative to the value token's de-quoted text, not
+ * the raw command). ``sourceRanges.ts`` maps these to absolute command
+ * positions for textarea highlighting. */
+export interface FilterRange {
+  start: number;
+  end: number;
 }
 
 export interface FilterArgument {
   key: string;
   value: string;
+  /** Offset of this ``key=value`` (or positional value) within the expression. */
+  range?: FilterRange;
 }
 
 export interface FilterStep {
   name: string;
   args: FilterArgument[];
+  /** Offset of the whole filter step (name + args) within the expression. */
+  range?: FilterRange;
 }
 
 export interface FilterChain {
@@ -70,12 +88,17 @@ export interface FilterChain {
   inputPads?: string[];
   /** Pad labels produced by this chain (the trailing ``[...]`` groups). */
   outputPads?: string[];
+  /** Offset of the whole chain within the expression. */
+  range?: FilterRange;
 }
 
 export interface FilterGraph {
   id: string;
   expression: string;
   chains?: FilterChain[];
+  /** Token id of the expression value, so the absolute source positions of
+   * chain/step/arg ranges can be recovered for textarea highlighting. */
+  valueTokenId?: string;
 }
 
 export interface SemanticCommand {
