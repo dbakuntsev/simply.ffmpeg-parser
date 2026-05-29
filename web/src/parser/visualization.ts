@@ -347,8 +347,15 @@ export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
     const producerByPad = new Map<string, string>();
     chainBoxes.forEach((c) => c.outputPads.forEach((pad) => producerByPad.set(pad, c.id)));
 
-    // demuxer/chain → chain, via input pads
+    // demuxer/chain → chain, via input pads. A chain with no explicit input
+    // pads relies on ffmpeg's automatic input assignment — fan in from all
+    // demuxers so the box isn't visually orphaned (e.g. ``overlay=...`` with
+    // no ``[0:v][1:v]`` labels).
     chainBoxes.forEach((c) => {
+      if (c.inputPads.length === 0) {
+        demuxerIds.forEach((src) => edges.push({ source: src, target: c.id }));
+        return;
+      }
       c.inputPads.forEach((pad) => {
         const file = FILE_PAD_RE.exec(pad);
         if (file) {
