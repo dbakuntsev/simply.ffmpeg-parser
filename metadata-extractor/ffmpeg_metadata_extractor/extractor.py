@@ -63,7 +63,9 @@ from .parsing import (
     parse_demuxers_xml,
     parse_filters_xml,
     parse_format_options_xml,
+    parse_input_devices_xml,
     parse_muxers_xml,
+    parse_output_devices_xml,
     parse_options_xml,
     parse_per_codec_options_xml,
     parse_per_format_options_xml,
@@ -866,6 +868,28 @@ def _extract_named(
     ]
 
 
+def _merge_named_dicts(primary: list[dict], extra: list[dict]) -> list[dict]:
+    """Merge two serialized ``NamedEntry`` lists, primary entries winning on
+    name collision. Used to fold input/output devices into the demuxers/muxers
+    bundles without losing the demuxer-side description when a name appears in
+    both (e.g. ``fbdev`` is documented as both an indev and an outdev).
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for entry in (*primary, *extra):
+        name = entry.get("name", "")
+        if name in seen:
+            continue
+        seen.add(name)
+        # Entries coming from device sources skipped _attach_per_format_options
+        # (which only knows muxers/demuxers texis) — give them an empty options
+        # list so the SPA's shape expectation holds across all entries.
+        entry.setdefault("options", [])
+        out.append(entry)
+    out.sort(key=lambda e: e.get("name", ""))
+    return out
+
+
 def _write_json(path: Path, payload: dict | list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -1189,6 +1213,15 @@ def _extract_and_write(
                 demuxers, doc_root, "demuxers.texi", "demuxer",
                 makeinfo_cmd, logger, c_map, xml_cache,
             )
+            # Input devices are selected with the same ``-f`` flag as demuxers
+            # (libavdevice exposes them as demuxers at runtime), so they're
+            # merged into the demuxers bundle. Without this the SPA emits a
+            # spurious ``unknown-demuxer`` warning for ``-f lavfi`` etc.
+            indevs = _extract_named(
+                doc_root, "indevs.texi", parse_input_devices_xml,
+                "input devices", makeinfo_cmd, logger, xml_cache,
+            )
+            demuxers = _merge_named_dicts(demuxers, indevs)
             _write_json(output_dir / "demuxers.json", {"demuxers": demuxers})
 
         if "muxers" in config.categories:
@@ -1200,6 +1233,11 @@ def _extract_and_write(
                 muxers, doc_root, "muxers.texi", "muxer",
                 makeinfo_cmd, logger, c_map, xml_cache,
             )
+            outdevs = _extract_named(
+                doc_root, "outdevs.texi", parse_output_devices_xml,
+                "output devices", makeinfo_cmd, logger, xml_cache,
+            )
+            muxers = _merge_named_dicts(muxers, outdevs)
             format_options = _extract_format_options(
                 doc_root, makeinfo_cmd, logger, c_map, xml_cache,
             )

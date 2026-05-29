@@ -1665,3 +1665,22 @@ def parse_bitstream_filters_xml(root: ET.Element) -> list[NamedEntry]:
         root, lambda t: t.strip().lower() == "bitstream filters", out
     )
     return out
+
+
+def parse_input_devices_xml(root: ET.Element) -> list[NamedEntry]:
+    # Input devices share the ``-f`` flag with demuxers (libavdevice surfaces
+    # them as demuxers at runtime), so they're merged into the demuxers bundle
+    # downstream — see ``_extract_named`` calls in ``extractor.py``.
+    out: list[NamedEntry] = []
+    _collect_named_sections(
+        root, lambda t: t.strip().lower() == "input devices", out
+    )
+    return out
+
+
+def parse_output_devices_xml(root: ET.Element) -> list[NamedEntry]:
+    out: list[NamedEntry] = []
+    _collect_named_sections(
+        root, lambda t: t.strip().lower() == "output devices", out
+    )
+    return out
