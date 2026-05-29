@@ -17,7 +17,13 @@ export function buildSemantic(
   const filterGraphs: {
     id: string;
     expression: string;
-    chains?: { id: string; label: string; filters: { name: string; args: { key: string; value: string }[] }[] }[];
+    chains?: {
+      id: string;
+      label: string;
+      filters: { name: string; args: { key: string; value: string }[] }[];
+      inputPads?: string[];
+      outputPads?: string[];
+    }[];
   }[] = [];
 
   let inputIndex = -1;

@@ -134,6 +134,17 @@ export function parseFilterComplex(expression: string) {
   return chains.map((chain, index) => {
     const bracketMatches = Array.from(chain.matchAll(/\[[^\]]+\]/g)).map((m) => m[0]);
     const bracketLabel = bracketMatches.join("");
+
+    // Within a single ``;``-delimited chain, pad labels only appear as a run of
+    // ``[...]`` groups at the very start (inputs to the first filter) and at the
+    // very end (outputs of the last filter). Capture each run with brackets
+    // stripped so the pipeline router can match file pads (``0:v``) to inputs
+    // and named pads (``tmp``) across chains.
+    const padNames = (run: string | undefined) =>
+      run ? Array.from(run.matchAll(/\[([^\]]+)\]/g)).map((m) => m[1]) : [];
+    const inputPads = padNames(chain.match(/^(?:\s*\[[^\]]+\]\s*)+/)?.[0]);
+    const outputPads = padNames(chain.match(/(?:\s*\[[^\]]+\]\s*)+$/)?.[0]);
+
     const cleaned = chain.replace(/\[[^\]]+\]/g, "");
     const filterSegments = splitChainFilters(cleaned);
 
@@ -148,6 +159,8 @@ export function parseFilterComplex(expression: string) {
       id: `fc_${index}`,
       label: bracketLabel ? `${bracketLabel} ${filterNames.join(" → ")}`.trim() : filterNames.join(" → "),
       filters: filterSteps,
+      inputPads,
+      outputPads,
     };
   });
 }

@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CommandInput } from "./components/CommandInput";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
-import { FlowChart } from "./components/FlowChart";
+import { PipelineChart } from "./components/PipelineChart";
 import { SelectionPanel } from "./components/SelectionPanel";
 import { SummaryStrip } from "./components/SummaryStrip";
 import { TreeList } from "./components/TreeList";
 import { VersionSelector } from "./components/VersionSelector";
 import { useMetadata } from "./hooks/useMetadata";
 import { useSelection } from "./hooks/useSelection";
-import { analyzeCommand, buildFlowNodes, buildTreeNodes } from "./parser";
+import { analyzeCommand, buildPipelineModel, buildTreeNodes } from "./parser";
 import { buildSelectionInfo } from "./selection";
 import type { Issue } from "./types";
 
@@ -37,8 +37,8 @@ export default function App() {
   }, [submitted, metadata]);
 
   const issues = analysis?.issues ?? [];
-  const flow = useMemo(
-    () => (analysis ? buildFlowNodes(analysis.semantic) : { nodes: [], links: [] }),
+  const pipeline = useMemo(
+    () => (analysis ? buildPipelineModel(analysis.semantic) : { boxes: [], edges: [] }),
     [analysis]
   );
   const treeNodes = useMemo(() => (analysis ? buildTreeNodes(analysis.semantic) : []), [analysis]);
@@ -90,9 +90,8 @@ export default function App() {
           <SummaryStrip semantic={analysis?.semantic ?? null} />
         </div>
         <div className="mt-4 grid gap-4">
-          <FlowChart
-            nodes={flow.nodes}
-            links={flow.links}
+          <PipelineChart
+            model={pipeline}
             selectedNode={selectedNode}
             onSelect={select}
           />

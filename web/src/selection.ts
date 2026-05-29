@@ -319,6 +319,45 @@ function formatResolutionSource(binding: OptionBinding): string | null {
   }
 }
 
+/** Selection entry for a demuxer/muxer pipeline box. Reuses the documented
+ * format entry (and its doc link) when the file carries an explicit ``-f``;
+ * otherwise notes that ffmpeg auto-detects the format from the extension. */
+function buildFormatStageSelection(
+  kind: "demuxer" | "muxer",
+  options: OptionBinding[],
+  lookups: CatalogLookups,
+  version: string,
+  docTokens?: Record<string, string>
+): SelectionInfo {
+  const label = kind === "demuxer" ? "Demuxer" : "Muxer";
+  const fmtOpt = options.find((o) => splitStreamSpecifier(o.flag.toLowerCase()).base === "-f");
+  const value = fmtOpt && fmtOpt.values.length ? fmtOpt.values[0] : null;
+  if (value) {
+    const entry =
+      kind === "demuxer" ? lookups.demuxers.get(value.toLowerCase()) : lookups.muxers.get(value.toLowerCase());
+    const description: string[] = [];
+    let extraDocs: SelectionDocLink[] | undefined;
+    if (entry) {
+      const enr = describeNamedEntry(entry, label, version, value, docTokens);
+      description.push(...enr.paragraphs);
+      if (enr.docLink) extraDocs = [enr.docLink];
+    }
+    return {
+      title: `${label}: ${value}`,
+      detail: `${label}: ${value}`,
+      fields: [{ label: "Format", value }],
+      description,
+      extraDocs,
+    };
+  }
+  return {
+    title: label,
+    detail: "Auto-detected from file extension.",
+    fields: [{ label: "Format", value: "auto (by extension)" }],
+    description: [`No explicit \`-f\` given; ffmpeg selects the ${kind} from the file extension or content.`],
+  };
+}
+
 function buildOptionSelection(
   scopeLabel: string,
   scope: "global" | "input" | "output",
@@ -472,6 +511,7 @@ export function buildSelectionInfo(
     };
     info.set(input.id, sel);
     info.set(`input_${index}`, sel);
+    info.set(`demuxer_${index}`, buildFormatStageSelection("demuxer", input.options, lookups, version, docTokens));
     input.options.forEach((opt) => {
       info.set(
         opt.id,
@@ -500,6 +540,7 @@ export function buildSelectionInfo(
     };
     info.set(output.id, sel);
     info.set(`output_${index}`, sel);
+    info.set(`muxer_${index}`, buildFormatStageSelection("muxer", output.options, lookups, version, docTokens));
     output.options.forEach((opt) => {
       info.set(
         opt.id,

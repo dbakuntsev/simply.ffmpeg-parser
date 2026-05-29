@@ -62,6 +62,14 @@ export interface FilterChain {
   id: string;
   label: string;
   filters: FilterStep[];
+  /** Pad labels consumed by this chain (the leading ``[...]`` groups), with
+   * the brackets stripped — e.g. ``["0:v", "1:v"]`` for
+   * ``[0:v][1:v]overlay...``. A file pad (``"0:v"``) routes from an input;
+   * a named pad (``"tmp"``) routes from the chain that produced it. Used by
+   * the pipeline visualization for real edge routing. */
+  inputPads?: string[];
+  /** Pad labels produced by this chain (the trailing ``[...]`` groups). */
+  outputPads?: string[];
 }
 
 export interface FilterGraph {

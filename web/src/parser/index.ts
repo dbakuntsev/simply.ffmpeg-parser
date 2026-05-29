@@ -26,6 +26,13 @@ export function analyzeCommand(command: string, metadata: MetadataBundle): Parse
   return { tokens, semantic, issues, resolved };
 }
 
-export { buildTreeNodes, buildFlowNodes, summarizeCommand } from "./visualization";
+export { buildTreeNodes, buildPipelineModel, summarizeCommand } from "./visualization";
+export type {
+  PipelineModel,
+  PipelineBox,
+  PipelineEdge,
+  PipelineRow,
+  PipelineStage,
+} from "./visualization";
 export { splitStreamSpecifier } from "./streamSpecifier";
 export type { ResolvedOption, ResolutionSource } from "./resolver";

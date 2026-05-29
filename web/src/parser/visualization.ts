@@ -179,51 +179,232 @@ export function buildTreeNodes(semantic: SemanticCommand): TreeNode[] {
   ];
 }
 
-export function buildFlowNodes(semantic: SemanticCommand) {
-  const nodes: { id: string; label: string; group: "input" | "filter" | "output" }[] = [];
-  const links: { source: string; target: string }[] = [];
+export type PipelineStage = "input" | "demuxer" | "transform" | "muxer" | "output";
 
-  semantic.inputs.forEach((input, index) => {
-    const id = `input_${index}`;
-    nodes.push({ id, label: input.source, group: "input" });
+export interface PipelineRow {
+  /** Existing selection id (option/step/arg) so clicking opens the inspector. */
+  id: string;
+  text: string;
+  /** Render one level indented — used for filter-step arguments. */
+  indent?: boolean;
+}
+
+export interface PipelineBox {
+  id: string;
+  stage: PipelineStage;
+  title: string;
+  subtitle?: string;
+  /** False for synthetic boxes that have no entry in ``buildSelectionInfo``. */
+  selectable: boolean;
+  rows: PipelineRow[];
+}
+
+export interface PipelineEdge {
+  source: string;
+  target: string;
+}
+
+export interface PipelineModel {
+  boxes: PipelineBox[];
+  edges: PipelineEdge[];
+}
+
+/** Which pipeline stage an input/output option belongs to. ``-f`` and any
+ * format-resolved option describe the (de)muxer; codec selectors and
+ * codec-resolved options describe the decoder/encoder (shown in the
+ * demuxer/muxer box); everything else stays on the file box. */
+function optionStage(opt: OptionBinding): "format" | "codec" | "file" {
+  const { base } = splitStreamSpecifier(opt.flag.toLowerCase());
+  if (base === "-f" || opt.resolutionSource === "format-private" || opt.resolutionSource === "format-generic") {
+    return "format";
+  }
+  if (
+    CODEC_SELECTOR_BASES.has(base) ||
+    opt.resolutionSource === "codec-private" ||
+    opt.resolutionSource === "codec-generic"
+  ) {
+    return "codec";
+  }
+  return "file";
+}
+
+function rowsFor(options: OptionBinding[], stages: Array<"format" | "codec" | "file">): PipelineRow[] {
+  return options
+    .filter((opt) => stages.includes(optionStage(opt)))
+    .map((opt) => ({ id: opt.id, text: optionLabel(opt) }));
+}
+
+function formatName(options: OptionBinding[]): string | null {
+  const fmt = options.find((opt) => splitStreamSpecifier(opt.flag.toLowerCase()).base === "-f");
+  return fmt && fmt.values.length ? fmt.values[0] : null;
+}
+
+const FILE_PAD_RE = /^(\d+)(?::|$)/;
+const PAD_LABEL_RE = /\[([^\]]+)\]/g;
+
+export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
+  const boxes: PipelineBox[] = [];
+  const edges: PipelineEdge[] = [];
+
+  // input + demuxer columns
+  semantic.inputs.forEach((input, i) => {
+    boxes.push({
+      id: `input_${i}`,
+      stage: "input",
+      title: input.source,
+      selectable: true,
+      rows: rowsFor(input.options, ["file"]),
+    });
+    const fmt = formatName(input.options);
+    boxes.push({
+      id: `demuxer_${i}`,
+      stage: "demuxer",
+      title: fmt ?? "auto",
+      subtitle: fmt ? undefined : "(by extension)",
+      selectable: true,
+      rows: rowsFor(input.options, ["format", "codec"]),
+    });
+    edges.push({ source: `input_${i}`, target: `demuxer_${i}` });
   });
 
-  const filterNodes: { id: string; label: string }[] = [];
+  // transform column
+  const chainBoxes: Array<{ id: string; inputPads: string[]; outputPads: string[] }> = [];
+  let hasFilters = false;
   semantic.filters.forEach((filter) => {
+    hasFilters = true;
     if (filter.chains && filter.chains.length > 0) {
-      filter.chains.forEach((chain, index) => {
-        filterNodes.push({ id: `${filter.id}_chain_${index}`, label: chain.label || "Filter Chain" });
+      filter.chains.forEach((chain) => {
+        const stepRows: PipelineRow[] = [];
+        chain.filters.forEach((step, k) => {
+          const stepId = `${chain.id}_step_${k}`;
+          stepRows.push({ id: stepId, text: step.name });
+          step.args.forEach((arg, j) => {
+            stepRows.push({ id: `${stepId}_arg_${j}`, text: `${arg.key} = ${arg.value}`, indent: true });
+          });
+        });
+        const names = chain.filters.map((s) => s.name).filter(Boolean).join(" → ");
+        boxes.push({
+          id: chain.id,
+          stage: "transform",
+          title: names || chain.label || "Filter Chain",
+          selectable: true,
+          rows: stepRows,
+        });
+        chainBoxes.push({
+          id: chain.id,
+          inputPads: chain.inputPads ?? [],
+          outputPads: chain.outputPads ?? [],
+        });
       });
       return;
     }
-    filterNodes.push({ id: filter.id, label: filter.expression });
+    // -vf / -af graph: no parsed pad routing, fanned below.
+    boxes.push({
+      id: filter.id,
+      stage: "transform",
+      title: filter.expression,
+      selectable: true,
+      rows: [],
+    });
   });
-
-  filterNodes.forEach((filter) => {
-    nodes.push({ id: filter.id, label: filter.label, group: "filter" });
-  });
-
-  semantic.outputs.forEach((output, index) => {
-    const id = `output_${index}`;
-    nodes.push({ id, label: output.target, group: "output" });
-  });
-
-  const inputIds = nodes.filter((n) => n.group === "input").map((n) => n.id);
-  const filterIds = nodes.filter((n) => n.group === "filter").map((n) => n.id);
-  const outputIds = nodes.filter((n) => n.group === "output").map((n) => n.id);
-
-  const midTargets = filterIds.length ? filterIds : outputIds;
-  inputIds.forEach((id) => {
-    midTargets.forEach((target) => links.push({ source: id, target }));
-  });
-
-  if (filterIds.length) {
-    filterIds.forEach((id) => {
-      outputIds.forEach((target) => links.push({ source: id, target }));
+  if (!hasFilters) {
+    boxes.push({
+      id: "transform_passthrough",
+      stage: "transform",
+      title: "copy / passthrough",
+      selectable: false,
+      rows: [],
     });
   }
 
-  return { nodes, links };
+  // muxer + output columns
+  semantic.outputs.forEach((output, j) => {
+    const fmt = formatName(output.options);
+    boxes.push({
+      id: `muxer_${j}`,
+      stage: "muxer",
+      title: fmt ?? "auto",
+      subtitle: fmt ? undefined : "(by extension)",
+      selectable: true,
+      rows: rowsFor(output.options, ["format", "codec"]),
+    });
+    boxes.push({
+      id: `output_${j}`,
+      stage: "output",
+      title: output.target,
+      selectable: true,
+      rows: rowsFor(output.options, ["file"]),
+    });
+    edges.push({ source: `muxer_${j}`, target: `output_${j}` });
+  });
+
+  // ---- routing between demuxer → transform → muxer ----
+  const transformBoxes = boxes.filter((b) => b.stage === "transform");
+  const nonChainTransform = transformBoxes.filter((b) => !chainBoxes.some((c) => c.id === b.id));
+  const demuxerIds = semantic.inputs.map((_, i) => `demuxer_${i}`);
+
+  if (chainBoxes.length > 0) {
+    const producerByPad = new Map<string, string>();
+    chainBoxes.forEach((c) => c.outputPads.forEach((pad) => producerByPad.set(pad, c.id)));
+
+    // demuxer/chain → chain, via input pads
+    chainBoxes.forEach((c) => {
+      c.inputPads.forEach((pad) => {
+        const file = FILE_PAD_RE.exec(pad);
+        if (file) {
+          const idx = Number(file[1]);
+          if (idx < demuxerIds.length) edges.push({ source: demuxerIds[idx], target: c.id });
+        } else if (producerByPad.has(pad)) {
+          edges.push({ source: producerByPad.get(pad)!, target: c.id });
+        }
+      });
+    });
+
+    // chain → muxer, via -map [label]; otherwise fan terminal chains
+    const consumedNamed = new Set<string>();
+    chainBoxes.forEach((c) =>
+      c.inputPads.forEach((pad) => {
+        if (!FILE_PAD_RE.test(pad)) consumedNamed.add(pad);
+      })
+    );
+    const terminalChains = chainBoxes.filter(
+      (c) => c.outputPads.length === 0 || c.outputPads.some((p) => !consumedNamed.has(p))
+    );
+    // ``-map`` is documented as a global option (the resolver classifies it as
+    // such), so look in both the output's own options and the globals pool.
+    const mapBindings = (output: SemanticCommand["outputs"][number]) =>
+      [...output.options, ...semantic.globals].filter(
+        (opt) => splitStreamSpecifier(opt.flag.toLowerCase()).base === "-map"
+      );
+    semantic.outputs.forEach((output, j) => {
+      const muxerId = `muxer_${j}`;
+      const mapped: string[] = [];
+      mapBindings(output).forEach((opt) =>
+        opt.values.forEach((v) => {
+          for (const m of v.matchAll(PAD_LABEL_RE)) {
+            const src = producerByPad.get(m[1]);
+            if (src) mapped.push(src);
+          }
+        })
+      );
+      if (mapped.length) {
+        mapped.forEach((src) => edges.push({ source: src, target: muxerId }));
+      } else {
+        terminalChains.forEach((c) => edges.push({ source: c.id, target: muxerId }));
+      }
+    });
+  }
+
+  // Fan any non-chain transform boxes (vf/af graphs, passthrough) across all
+  // demuxers and muxers — these carry no parsed pad routing.
+  if (nonChainTransform.length > 0) {
+    nonChainTransform.forEach((box) => {
+      demuxerIds.forEach((src) => edges.push({ source: src, target: box.id }));
+      semantic.outputs.forEach((_, j) => edges.push({ source: box.id, target: `muxer_${j}` }));
+    });
+  }
+
+  return { boxes, edges };
 }
 
 export function summarizeCommand(semantic: SemanticCommand, _codecs: CodecsMetadata, _filters: FiltersMetadata) {
