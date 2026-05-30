@@ -411,7 +411,19 @@ export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
     });
   }
 
-  return { boxes, edges };
+  // Dedupe parallel edges: a chain with input pads ``[0:1][0:2]…`` from the
+  // same file would otherwise emit one edge per pad, all sharing the same
+  // ``source->target`` key and confusing React's keyed reconciliation when the
+  // command changes (stale <path>s linger with bad geometry).
+  const seenEdges = new Set<string>();
+  const dedupedEdges = edges.filter((e) => {
+    const key = `${e.source}->${e.target}`;
+    if (seenEdges.has(key)) return false;
+    seenEdges.add(key);
+    return true;
+  });
+
+  return { boxes, edges: dedupedEdges };
 }
 
 export function summarizeCommand(semantic: SemanticCommand, _codecs: CodecsMetadata, _filters: FiltersMetadata) {
