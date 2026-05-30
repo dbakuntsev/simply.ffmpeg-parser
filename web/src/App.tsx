@@ -68,7 +68,11 @@ export default function App() {
     if (el.value !== submitted) return;
     const range = sourceRanges.get(selectedNode);
     if (!range) return;
-    el.focus();
+    // ``preventScroll`` keeps Firefox from scrolling the *page* so the textarea
+    // is visible — it otherwise reveals the textarea via the document scroll
+    // when focusing, which we don't want. We do our own scrolling of the
+    // textarea's own content below.
+    el.focus({ preventScroll: true });
     el.setSelectionRange(range.start, range.end);
     // Scroll the textarea's content so the highlighted span is visible (the
     // command may be long enough to scroll). setSelectionRange doesn't do this.
