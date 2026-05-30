@@ -24,7 +24,11 @@ from .avopt_c import (
     enrich_options_with_c_values,
 )
 from .config_texi import generate_config_texi
-from .options_c import apply_alias_map, build_alias_map
+from .options_c import (
+    apply_alias_map,
+    build_alias_map,
+    build_undocumented_options,
+)
 from .git_utils import (
     commit_at_or_before,
     list_tags,
@@ -532,7 +536,7 @@ def _extract_options(
             }
             for o in options
         ]
-        _augment_aliases_from_c(out, repo, tag, fallback_root, logger)
+        _augment_options_from_c(out, repo, tag, fallback_root, logger)
         return out
     raise ExtractionError("Options sources not found")
 
@@ -549,23 +553,35 @@ _OPTIONS_C_SOURCES = (
 )
 
 
-def _augment_aliases_from_c(
+def _augment_options_from_c(
     options: list[dict],
     repo: Path,
     tag: str,
     fallback_root: Path | None,
     logger: Logger,
 ) -> None:
-    """Fold undocumented option aliases from ``fftools/`` C sources into
-    ``options`` in place.
+    """Fold information from ``fftools/`` C sources into ``options`` in place.
 
-    Many short/legacy alternatives (e.g. ``-apre``/``-vpre``/``-spre`` for
-    ``-pre``, ``-stag`` for ``-tag``, ``-lavfi`` for ``-filter_complex`` on
-    older tags) share a backing handler with a documented option in
-    ``fftools/ffmpeg_opt.c`` but never get their own texi entry. Without
-    this pass, the SPA flags them as ``unknown-option``. The C-source
-    parser is best-effort: a tag where every file fails to fetch just
-    leaves the doc-derived aliases unchanged.
+    Two passes, both gap-fill only — documented entries are never
+    overwritten:
+
+    1. **Aliases**: short/legacy alternatives that share a backing
+       handler with a documented option (e.g. ``-apre``/``-vpre``/``-spre``
+       for ``-pre``, ``-stag`` for ``-tag``, ``-lavfi`` for
+       ``-filter_complex`` on older tags) are attached to the documented
+       canonical's ``aliases`` list.
+
+    2. **Top-level entries** for fully-undocumented options
+       (e.g. ``-hwaccel_output_format``, which has no texi entry on any
+       supported tag). Synthesized from the ``OptionDef`` row: scope and
+       valueType inferred from ``OPT_*`` flag tokens, description taken
+       verbatim from the row's short C help string. The doc-derived list
+       always wins on name collision — alias attachment happens first so
+       a name that becomes an alias never also gets a top-level synthetic
+       entry.
+
+    Best-effort: a tag where every file fails to fetch just leaves the
+    doc-derived options unchanged.
     """
     sources: dict[str, str] = {}
     for path in _OPTIONS_C_SOURCES:
@@ -573,17 +589,32 @@ def _augment_aliases_from_c(
         if text:
             sources[path] = text
     if not sources:
-        logger.debug("No fftools C sources available for alias augmentation")
+        logger.debug("No fftools C sources available for option augmentation")
         return
     documented = {o["name"] for o in options}
     alias_map = build_alias_map(sources, documented)
-    if not alias_map:
-        return
-    added = apply_alias_map(options, alias_map)
-    if added:
+    if alias_map:
+        added = apply_alias_map(options, alias_map)
+        if added:
+            logger.debug(
+                f"Augmented options.json with {added} aliases from "
+                f"{', '.join(sources)}"
+            )
+
+    # Recompute "covered" from the post-alias state — any name that
+    # build_alias_map just folded in as an alias must not also surface
+    # as a top-level synthetic entry.
+    covered: set[str] = set()
+    for o in options:
+        covered.add(o["name"])
+        covered.update(o.get("aliases") or [])
+    synthesized = build_undocumented_options(sources, covered)
+    if synthesized:
+        options.extend(synthesized)
+        options.sort(key=lambda o: o["name"])
         logger.debug(
-            f"Augmented options.json with {added} aliases from "
-            f"{', '.join(sources)}"
+            f"Augmented options.json with {len(synthesized)} synthesized "
+            f"entries for undocumented options from {', '.join(sources)}"
         )
 
 
