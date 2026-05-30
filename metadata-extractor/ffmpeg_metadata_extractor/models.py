@@ -4,6 +4,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+class ExtractionError(Exception):
+    """Raised by extraction steps that cannot recover (missing required
+    sources, malformed inputs). The orchestrator catches it per tag so a
+    single failure does not abort the run when ``--continue-on-error`` is
+    set."""
+
+
 @dataclass(frozen=True)
 class ExtractConfig:
     repo: Path
