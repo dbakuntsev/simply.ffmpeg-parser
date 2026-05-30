@@ -16,19 +16,34 @@ import type { Issue } from "./types";
 
 const SAMPLE = `ffmpeg -i input.mp4 -vf "scale=1280:-1" -c:v libx264 -c:a aac output.mp4`;
 const ANALYZE_DEBOUNCE_MS = 500;
+const COMMAND_STORAGE_KEY = "ffmpeg-parser:command";
+
+function readStoredCommand(): string {
+  try {
+    const stored = window.localStorage.getItem(COMMAND_STORAGE_KEY);
+    return stored ?? SAMPLE;
+  } catch {
+    return SAMPLE;
+  }
+}
 
 export default function App() {
-  const [command, setCommand] = useState(SAMPLE);
-  const [submitted, setSubmitted] = useState(SAMPLE);
+  const [command, setCommand] = useState(readStoredCommand);
+  const [submitted, setSubmitted] = useState(() => command.trim());
   const { versions, version, setVersion, metadata, lookups, versionTokens } = useMetadata();
   const { selectedNode, select, clear } = useSelection();
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Debounced auto-analyze
+  // Debounced auto-analyze + persist the command so it survives reloads.
   useEffect(() => {
     const handle = window.setTimeout(() => {
       setSubmitted(command.trim());
+      try {
+        window.localStorage.setItem(COMMAND_STORAGE_KEY, command);
+      } catch {
+        // ignore storage errors (private mode, quota, etc.)
+      }
     }, ANALYZE_DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
   }, [command]);

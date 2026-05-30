@@ -1,11 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { loadMetadata, loadVersionsCatalog } from "../metadata";
 import { buildMetadataLookups, MetadataLookups } from "../parser";
 import type { CacheTokens, MetadataBundle, VersionCacheTokens } from "../types";
 
+const VERSION_STORAGE_KEY = "ffmpeg-parser:version";
+
+function readStoredVersion(): string {
+  try {
+    return window.localStorage.getItem(VERSION_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export function useMetadata() {
   const [versions, setVersions] = useState<string[]>([]);
-  const [version, setVersion] = useState<string>("");
+  const [version, setVersionState] = useState<string>("");
   const [tokens, setTokens] = useState<CacheTokens>({});
   const [metadata, setMetadata] = useState<MetadataBundle | null>(null);
 
@@ -14,13 +24,24 @@ export function useMetadata() {
       .then(({ versions: list, tokens: tokenMap }) => {
         setVersions(list);
         setTokens(tokenMap);
-        setVersion(list[0] ?? "");
+        const stored = readStoredVersion();
+        setVersionState(stored && list.includes(stored) ? stored : list[0] ?? "");
       })
       .catch(() => {
         setVersions([]);
         setTokens({});
-        setVersion("");
+        setVersionState("");
       });
+  }, []);
+
+  const setVersion = useCallback((next: string) => {
+    setVersionState(next);
+    try {
+      if (next) window.localStorage.setItem(VERSION_STORAGE_KEY, next);
+      else window.localStorage.removeItem(VERSION_STORAGE_KEY);
+    } catch {
+      // ignore storage errors (private mode, quota, etc.)
+    }
   }, []);
 
   useEffect(() => {
