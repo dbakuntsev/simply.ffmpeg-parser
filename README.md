@@ -16,7 +16,8 @@ FFmpeg sources by a companion Python CLI.
 
 ## Screenshots
 
-<!-- TODO: add screenshots of the SPA here -->
+![Simple Sample Command](.github/screenshots/sample1.png)
+![Complex Sample Command](.github/screenshots/sample2.png)
 
 ## Features
 
