@@ -1,12 +1,13 @@
-import type { Issue, MetadataBundle, SemanticCommand, Token } from "../types";
+import type { Issue, SemanticCommand, Token } from "../types";
 import { nextIssueId } from "./ids";
+import { MetadataLookups } from "./lookups";
 import { ResolvedOption, shouldExpectValue } from "./resolver";
 import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./streamSpecifier";
 
 export function detectIssues(
   tokens: Token[],
   semantic: SemanticCommand,
-  metadata: MetadataBundle,
+  lookups: MetadataLookups,
   resolved: Map<string, ResolvedOption | null>
 ): Issue[] {
   const issues: Issue[] = [];
@@ -120,27 +121,20 @@ export function detectIssues(
     });
   }
 
-  issues.push(...validateNamedValues(tokens, metadata));
+  issues.push(...validateNamedValues(tokens, lookups));
 
   return issues;
 }
 
-function buildNameSet(entries: { name: string; aliases?: string[] }[] | undefined): Set<string> {
-  const set = new Set<string>();
-  for (const e of entries ?? []) {
-    set.add(e.name.toLowerCase());
-    for (const a of e.aliases || []) set.add(a.toLowerCase());
-  }
-  return set;
-}
-
-function validateNamedValues(tokens: Token[], metadata: MetadataBundle): Issue[] {
+function validateNamedValues(tokens: Token[], lookups: MetadataLookups): Issue[] {
   const issues: Issue[] = [];
 
-  const codecs = buildNameSet(metadata.codecs?.codecs);
-  const muxers = buildNameSet(metadata.muxers?.muxers);
-  const demuxers = buildNameSet(metadata.demuxers?.demuxers);
-  const bsfs = buildNameSet(metadata.bitstreamFilters?.bitstream_filters);
+  // Use the precomputed catalog Maps directly via ``.has()`` — saves rebuilding
+  // four name Sets on every analyze pass.
+  const codecs = lookups.codecNames;
+  const muxers = lookups.catalog.muxers;
+  const demuxers = lookups.catalog.demuxers;
+  const bsfs = lookups.catalog.bsfs;
 
   let seenInput = false;
   for (let i = 0; i < tokens.length; i += 1) {

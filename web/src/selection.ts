@@ -1,5 +1,5 @@
 import type { MetadataBundle, NamedEntry, OptionBinding, VersionCacheTokens } from "./types";
-import type { ParseResult, ResolvedOption } from "./parser";
+import type { CatalogLookups, FilterInfo, MetadataLookups, ParseResult, ResolvedOption } from "./parser";
 import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./parser";
 import { withVersionQuery } from "./metadata";
 
@@ -32,14 +32,6 @@ export type SelectionInfo = {
 };
 
 type OptionInfo = MetadataBundle["options"]["options"][number];
-type FilterInfo = MetadataBundle["filters"]["filters"][number];
-
-type CatalogLookups = {
-  demuxers: Map<string, NamedEntry>;
-  muxers: Map<string, NamedEntry>;
-  protocols: Map<string, NamedEntry>;
-  bsfs: Map<string, NamedEntry>;
-};
 
 /** Per-build context shared across every helper in this file. Bundling these
  * into one object avoids passing 6 parallel args through every layer (and
@@ -109,18 +101,6 @@ type ValueEnrichment = {
   /** Additional documentation link (different anchor than the option's own). */
   docLink?: SelectionDocLink;
 };
-
-function buildLookup(entries: NamedEntry[]): Map<string, NamedEntry> {
-  const map = new Map<string, NamedEntry>();
-  for (const entry of entries) {
-    map.set(entry.name.toLowerCase(), entry);
-    for (const alias of entry.aliases || []) {
-      const key = alias.toLowerCase();
-      if (!map.has(key)) map.set(key, entry);
-    }
-  }
-  return map;
-}
 
 function describeNamedEntry(
   ctx: SelectionCtx,
@@ -407,72 +387,26 @@ function buildOptionSelection(
 export function buildSelectionInfo(
   analysis: ParseResult,
   metadata: MetadataBundle,
+  lookups: MetadataLookups,
   version: string,
   versionTokens?: VersionCacheTokens
 ) {
   const info = new Map<string, SelectionInfo>();
-  const filterLookup = new Map<string, FilterInfo>();
-  metadata.filters.filters.forEach((filter) => {
-    filterLookup.set(filter.name, filter);
-    filter.aliases.forEach((alias) => filterLookup.set(alias, filter));
-  });
-
   const ctx: SelectionCtx = {
     metadata,
     resolved: analysis.resolved,
     version,
     docTokens: versionTokens?.doc,
-    filterLookup,
-    lookups: {
-      demuxers: buildLookup(metadata.demuxers?.demuxers ?? []),
-      muxers: buildLookup(metadata.muxers?.muxers ?? []),
-      protocols: buildLookup(metadata.protocols?.protocols ?? []),
-      bsfs: buildLookup(metadata.bitstreamFilters?.bitstream_filters ?? []),
-    },
+    filterLookup: lookups.filtersByName,
+    lookups: lookups.catalog,
   };
 
   analysis.semantic.inputs.forEach((input, index) => {
-    const fields: SelectionDetailItem[] = [
-      { label: "Source", value: input.source },
-      { label: "Index", value: String(index) },
-    ];
-    const description: string[] = [];
-    let extraDocs: SelectionDocLink[] | undefined;
-    const protocolEnrichment = enrichInputProtocol(ctx, input.source);
-    if (protocolEnrichment) {
-      description.push(...protocolEnrichment.paragraphs);
-      if (protocolEnrichment.docLink) extraDocs = [protocolEnrichment.docLink];
-    }
-    const sel: SelectionInfo = {
-      title: `Input ${index + 1}`,
-      detail: `Source: ${input.source}`,
-      fields,
-      description,
-      extraDocs,
-    };
-    info.set(input.id, sel);
-    info.set(`input_${index}`, sel);
-    info.set(`demuxer_${index}`, buildFormatStageSelection(ctx, "demuxer", input.options));
-    input.options.forEach((opt) => {
-      info.set(opt.id, buildOptionSelection(ctx, "Input-level option", "input", opt));
-    });
+    addEndpointSelections(info, ctx, "input", input, index);
   });
 
   analysis.semantic.outputs.forEach((output, index) => {
-    const sel: SelectionInfo = {
-      title: `Output ${index + 1}`,
-      detail: `Target: ${output.target}`,
-      fields: [
-        { label: "Target", value: output.target },
-        { label: "Index", value: String(index) },
-      ],
-    };
-    info.set(output.id, sel);
-    info.set(`output_${index}`, sel);
-    info.set(`muxer_${index}`, buildFormatStageSelection(ctx, "muxer", output.options));
-    output.options.forEach((opt) => {
-      info.set(opt.id, buildOptionSelection(ctx, "Output-level option", "output", opt));
-    });
+    addEndpointSelections(info, ctx, "output", output, index);
   });
 
   analysis.semantic.globals.forEach((opt) => {
@@ -480,67 +414,128 @@ export function buildSelectionInfo(
   });
 
   analysis.semantic.filters.forEach((filter, filterIndex) => {
-    const graphSel: SelectionInfo = {
-      title: "Filter Graph",
-      detail: buildFilterGraphExplanation(filterIndex + 1, filter),
-      fields: [
-        { label: "Chains", value: String(filter.chains?.length ?? 1) },
-        { label: "Expression length", value: `${filter.expression.length} chars` },
-      ],
-      description: ["Complex filtergraph."],
-    };
-    info.set(filter.id, graphSel);
-
-    if (filter.chains) {
-      filter.chains.forEach((chain, chainIndex) => {
-        const chainSel: SelectionInfo = {
-          title: `Filter Chain ${chainIndex + 1}`,
-          detail: buildFilterChainExplanation(chain),
-          fields: [
-            { label: "Steps", value: String(chain.filters.length) },
-            ...(chain.label ? [{ label: "Labels", value: chain.label }] : []),
-          ],
-        };
-        info.set(chain.id, chainSel);
-        info.set(`${filter.id}_chain_${chainIndex}`, chainSel);
-
-        chain.filters.forEach((step, stepIndex) => {
-          const stepId = `${chain.id}_step_${stepIndex}`;
-          const filterInfo = ctx.filterLookup.get(step.name.toLowerCase());
-          const fields: SelectionDetailItem[] = [
-            { label: "Filter", value: step.name },
-            { label: "Arguments", value: String(step.args.length) },
-          ];
-          if (filterInfo) {
-            fields.push({ label: "Type", value: filterInfo.type });
-          }
-          const description = filterInfo?.description?.length ? [...filterInfo.description] : [];
-          info.set(stepId, {
-            title: filterInfo?.name ?? step.name,
-            detail: buildFilterStepExplanation(step.name, step.args, filterInfo),
-            fields,
-            description,
-            docsUrl: docsUrlForFilter(ctx, step.name),
-          });
-          step.args.forEach((arg, argIndex) => {
-            const argDescription = buildFilterArgExplanation(arg.key, filterInfo);
-            info.set(`${stepId}_arg_${argIndex}`, {
-              title: `${step.name} · ${arg.key}`,
-              detail: argDescription ? `${arg.value}\n${argDescription}` : arg.value,
-              fields: [
-                { label: "Key", value: arg.key },
-                { label: "Value", value: arg.value },
-              ],
-              description: argDescription ? [argDescription] : [],
-              docsUrl: docsUrlForFilter(ctx, step.name),
-            });
-          });
-        });
-      });
-    }
+    addFilterSelections(info, ctx, filter, filterIndex);
   });
 
   return info;
+}
+
+/** Build the selection entries for one input or one output: the endpoint box
+ * itself (under both ``input.id`` and ``input_${index}`` for tree/chart parity,
+ * see CLAUDE.md "Selection IDs are intentionally duplicated"), the matching
+ * demuxer/muxer stage, and each attached option. The input variant additionally
+ * tries to enrich with protocol info from the source URL scheme. */
+function addEndpointSelections(
+  info: Map<string, SelectionInfo>,
+  ctx: SelectionCtx,
+  kind: "input" | "output",
+  endpoint: ParseResult["semantic"]["inputs"][number] | ParseResult["semantic"]["outputs"][number],
+  index: number
+) {
+  const isInput = kind === "input";
+  // Discriminate without a type guard — both halves of the union share
+  // ``id``/``options`` but each carries a different file-pointer key. The
+  // caller already knows which one based on ``kind``.
+  const fileValue = isInput
+    ? (endpoint as ParseResult["semantic"]["inputs"][number]).source
+    : (endpoint as ParseResult["semantic"]["outputs"][number]).target;
+  const stage: "demuxer" | "muxer" = isInput ? "demuxer" : "muxer";
+  const titleWord = isInput ? "Input" : "Output";
+  const sourceLabel = isInput ? "Source" : "Target";
+  const optionScopeLabel = isInput ? "Input-level option" : "Output-level option";
+
+  const fields: SelectionDetailItem[] = [
+    { label: sourceLabel, value: fileValue },
+    { label: "Index", value: String(index) },
+  ];
+  const description: string[] = [];
+  let extraDocs: SelectionDocLink[] | undefined;
+  if (isInput) {
+    const protocolEnrichment = enrichInputProtocol(ctx, fileValue);
+    if (protocolEnrichment) {
+      description.push(...protocolEnrichment.paragraphs);
+      if (protocolEnrichment.docLink) extraDocs = [protocolEnrichment.docLink];
+    }
+  }
+  const sel: SelectionInfo = {
+    title: `${titleWord} ${index + 1}`,
+    detail: `${sourceLabel}: ${fileValue}`,
+    fields,
+    description: description.length || isInput ? description : undefined,
+    extraDocs,
+  };
+  info.set(endpoint.id, sel);
+  info.set(`${kind}_${index}`, sel);
+  info.set(`${stage}_${index}`, buildFormatStageSelection(ctx, stage, endpoint.options));
+  endpoint.options.forEach((opt) => {
+    info.set(opt.id, buildOptionSelection(ctx, optionScopeLabel, kind, opt));
+  });
+}
+
+/** Build the four-tier selection entries for one filtergraph: the graph
+ * itself, each chain (registered under both its own id and a
+ * ``${filter.id}_chain_${i}`` alias), each step, and each argument. */
+function addFilterSelections(
+  info: Map<string, SelectionInfo>,
+  ctx: SelectionCtx,
+  filter: ParseResult["semantic"]["filters"][number],
+  filterIndex: number
+) {
+  const graphSel: SelectionInfo = {
+    title: "Filter Graph",
+    detail: buildFilterGraphExplanation(filterIndex + 1, filter),
+    fields: [
+      { label: "Chains", value: String(filter.chains?.length ?? 1) },
+      { label: "Expression length", value: `${filter.expression.length} chars` },
+    ],
+    description: ["Complex filtergraph."],
+  };
+  info.set(filter.id, graphSel);
+  if (!filter.chains) return;
+
+  filter.chains.forEach((chain, chainIndex) => {
+    const chainSel: SelectionInfo = {
+      title: `Filter Chain ${chainIndex + 1}`,
+      detail: buildFilterChainExplanation(chain),
+      fields: [
+        { label: "Steps", value: String(chain.filters.length) },
+        ...(chain.label ? [{ label: "Labels", value: chain.label }] : []),
+      ],
+    };
+    info.set(chain.id, chainSel);
+    info.set(`${filter.id}_chain_${chainIndex}`, chainSel);
+
+    chain.filters.forEach((step, stepIndex) => {
+      const stepId = `${chain.id}_step_${stepIndex}`;
+      const filterInfo = ctx.filterLookup.get(step.name.toLowerCase());
+      const fields: SelectionDetailItem[] = [
+        { label: "Filter", value: step.name },
+        { label: "Arguments", value: String(step.args.length) },
+      ];
+      if (filterInfo) fields.push({ label: "Type", value: filterInfo.type });
+      const description = filterInfo?.description?.length ? [...filterInfo.description] : [];
+      info.set(stepId, {
+        title: filterInfo?.name ?? step.name,
+        detail: buildFilterStepExplanation(step.name, step.args, filterInfo),
+        fields,
+        description,
+        docsUrl: docsUrlForFilter(ctx, step.name),
+      });
+      step.args.forEach((arg, argIndex) => {
+        const argDescription = buildFilterArgExplanation(arg.key, filterInfo);
+        info.set(`${stepId}_arg_${argIndex}`, {
+          title: `${step.name} · ${arg.key}`,
+          detail: argDescription ? `${arg.value}\n${argDescription}` : arg.value,
+          fields: [
+            { label: "Key", value: arg.key },
+            { label: "Value", value: arg.value },
+          ],
+          description: argDescription ? [argDescription] : [],
+          docsUrl: docsUrlForFilter(ctx, step.name),
+        });
+      });
+    });
+  });
 }
 
 function buildFilterGraphExplanation(

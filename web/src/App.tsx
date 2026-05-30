@@ -20,7 +20,7 @@ const ANALYZE_DEBOUNCE_MS = 500;
 export default function App() {
   const [command, setCommand] = useState(SAMPLE);
   const [submitted, setSubmitted] = useState(SAMPLE);
-  const { versions, version, setVersion, metadata, versionTokens } = useMetadata();
+  const { versions, version, setVersion, metadata, lookups, versionTokens } = useMetadata();
   const { selectedNode, select, clear } = useSelection();
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -35,8 +35,8 @@ export default function App() {
 
   const analysis = useMemo(() => {
     if (!metadata) return null;
-    return analyzeCommand(submitted, metadata);
-  }, [submitted, metadata]);
+    return analyzeCommand(submitted, metadata, lookups ?? undefined);
+  }, [submitted, metadata, lookups]);
 
   const issues = analysis?.issues ?? [];
   const pipeline = useMemo(
@@ -46,8 +46,11 @@ export default function App() {
   const treeNodes = useMemo(() => (analysis ? buildTreeNodes(analysis.semantic) : []), [analysis]);
 
   const selectionInfo = useMemo(
-    () => (analysis && metadata ? buildSelectionInfo(analysis, metadata, version, versionTokens) : new Map()),
-    [analysis, metadata, version, versionTokens]
+    () =>
+      analysis && metadata && lookups
+        ? buildSelectionInfo(analysis, metadata, lookups, version, versionTokens)
+        : new Map(),
+    [analysis, metadata, lookups, version, versionTokens]
   );
   const selection = selectedNode ? selectionInfo.get(selectedNode) ?? null : null;
 

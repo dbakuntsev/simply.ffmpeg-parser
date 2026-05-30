@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { loadMetadata, loadVersionsCatalog } from "../metadata";
+import { buildMetadataLookups, MetadataLookups } from "../parser";
 import type { CacheTokens, MetadataBundle, VersionCacheTokens } from "../types";
 
 export function useMetadata() {
@@ -36,5 +37,14 @@ export function useMetadata() {
     [version, tokens]
   );
 
-  return { versions, version, setVersion, metadata, versionTokens };
+  // Precompute name/alias lookups once per loaded metadata bundle. Threaded
+  // into ``analyzeCommand`` (for diagnostics' existence checks) and
+  // ``buildSelectionInfo`` (for popover enrichment) so they don't rebuild
+  // four ~500-entry Maps on every keystroke.
+  const lookups: MetadataLookups | null = useMemo(
+    () => (metadata ? buildMetadataLookups(metadata) : null),
+    [metadata]
+  );
+
+  return { versions, version, setVersion, metadata, lookups, versionTokens };
 }
