@@ -14,9 +14,6 @@ FFmpeg sources by a companion Python CLI.
 
 **Live app:** <https://dbakuntsev.github.io/simply.ffmpeg-parser/>
 
-## Screenshots
-
-![Simple Sample Command](.github/screenshots/sample1.png)
 ![Complex Sample Command](.github/screenshots/sample2.png)
 
 ## Features
