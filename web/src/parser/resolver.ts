@@ -24,7 +24,7 @@
  */
 
 import type { AVOptionEntry, MetadataBundle, Token } from "../types";
-import { splitStreamSpecifier } from "./streamSpecifier";
+import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./streamSpecifier";
 
 export type OptionInfo = MetadataBundle["options"]["options"][number];
 
@@ -159,8 +159,6 @@ interface ResolutionContext {
   /** Most recently selected format and its side (input vs output). */
   format?: { name: string; side: "muxer" | "demuxer" };
 }
-
-const CODEC_SELECTION_BASES = new Set(["-c", "-codec", "-vcodec", "-acodec", "-scodec"]);
 
 function inferStreamTypeFromCodecFlag(
   flag: string,
@@ -358,7 +356,7 @@ export function resolveAll(
     // Track active codec selection BEFORE resolving — so a codec set on this
     // token can affect the same token's resolution (rare but happens for
     // self-referential aliases).
-    if (CODEC_SELECTION_BASES.has(base)) {
+    if (CODEC_SELECTOR_BASES.has(base)) {
       const value = tokens[i + 1];
       if (value && value.type !== "flag") {
         const t = inferStreamTypeFromCodecFlag(token.normalizedText, specifier);

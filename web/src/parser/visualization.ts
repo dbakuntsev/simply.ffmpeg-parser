@@ -1,9 +1,7 @@
 import type { CodecsMetadata, FiltersMetadata, OptionBinding, SemanticCommand } from "../types";
 import type { TreeNode } from "../components/TreeList";
 import { isFilterComplexBinding } from "./filters";
-import { splitStreamSpecifier } from "./streamSpecifier";
-
-const CODEC_SELECTOR_BASES = new Set(["-c", "-codec", "-vcodec", "-acodec", "-scodec"]);
+import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./streamSpecifier";
 
 function isCodecSelector(opt: OptionBinding): boolean {
   const { base } = splitStreamSpecifier(opt.flag.toLowerCase());

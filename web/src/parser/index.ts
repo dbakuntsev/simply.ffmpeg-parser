@@ -34,5 +34,5 @@ export type {
   PipelineRow,
   PipelineStage,
 } from "./visualization";
-export { splitStreamSpecifier } from "./streamSpecifier";
+export { splitStreamSpecifier, CODEC_SELECTOR_BASES } from "./streamSpecifier";
 export type { ResolvedOption, ResolutionSource } from "./resolver";

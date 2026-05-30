@@ -1,6 +1,6 @@
 import type { MetadataBundle, NamedEntry, OptionBinding, VersionCacheTokens } from "./types";
 import type { ParseResult, ResolvedOption } from "./parser";
-import { splitStreamSpecifier } from "./parser";
+import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./parser";
 import { withVersionQuery } from "./metadata";
 
 const DOC_ENTRY_FILENAME = "ffmpeg-all.html";
@@ -34,60 +34,25 @@ export type SelectionInfo = {
 type OptionInfo = MetadataBundle["options"]["options"][number];
 type FilterInfo = MetadataBundle["filters"]["filters"][number];
 
-type OptionExplanation = {
-  title: string;
-  lines: string[];
+type CatalogLookups = {
+  demuxers: Map<string, NamedEntry>;
+  muxers: Map<string, NamedEntry>;
+  protocols: Map<string, NamedEntry>;
+  bsfs: Map<string, NamedEntry>;
 };
 
-const OPTION_EXPLANATIONS: Record<string, OptionExplanation> = {
-  "-crf": {
-    title: "Constant Rate Factor",
-    lines: [
-      "Controls perceptual video quality for libx264/libx265.",
-      "Range: 0–51",
-      "Lower = better quality",
-      "Typical values: 18–28",
-    ],
-  },
-  "-preset": {
-    title: "Encoding Preset",
-    lines: [
-      "Controls encoder speed vs compression efficiency.",
-      "Slower = better compression, larger CPU cost.",
-    ],
-  },
-  "-b": {
-    title: "Bitrate",
-    lines: ["Sets target bitrate for the selected stream.", "Example: 192k, 2M."],
-  },
-  "-r": {
-    title: "Frame Rate",
-    lines: ["Sets output frame rate for the selected stream."],
-  },
-  "-movflags": {
-    title: "MOV Flags",
-    lines: ["Sets MOV/MP4 container flags.", "Example: +faststart moves moov atom to the front."],
-  },
-  "-c": {
-    title: "Codec Selection",
-    lines: ["Selects codec for the given stream.", "Use -c:v or -c:a for specific streams."],
-  },
-  "-map": {
-    title: "Stream Mapping",
-    lines: ["Selects which input streams go to which outputs."],
-  },
-  "-vf": {
-    title: "Video Filters",
-    lines: ["Applies a video filter chain to the selected stream."],
-  },
-  "-af": {
-    title: "Audio Filters",
-    lines: ["Applies an audio filter chain to the selected stream."],
-  },
-  "-filter_complex": {
-    title: "Complex Filtergraph",
-    lines: ["Defines a complex filtergraph with multiple inputs/outputs and labels."],
-  },
+/** Per-build context shared across every helper in this file. Bundling these
+ * into one object avoids passing 6 parallel args through every layer (and
+ * forgetting to forward ``docTokens`` to a new call site, which is how the
+ * cache-buster wiring originally regressed). Built once at the top of
+ * ``buildSelectionInfo`` and threaded through verbatim. */
+type SelectionCtx = {
+  metadata: MetadataBundle;
+  resolved: Map<string, ResolvedOption | null>;
+  lookups: CatalogLookups;
+  filterLookup: Map<string, FilterInfo>;
+  version: string;
+  docTokens?: Record<string, string>;
 };
 
 // Texinfo encodes non-alphanumeric characters in anchor IDs as `_XXXX` where
@@ -96,18 +61,14 @@ function texinfoAnchor(s: string) {
   return s.replace(/[^A-Za-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
-function docsBase(version: string, docTokens?: Record<string, string>) {
-  if (!version) return "";
-  const url = `./doc/ffmpeg/${encodeURIComponent(version)}/${DOC_ENTRY_FILENAME}`;
-  return withVersionQuery(url, docTokens?.[DOC_ENTRY_FILENAME]);
+function docsBase(ctx: SelectionCtx) {
+  if (!ctx.version) return "";
+  const url = `./doc/ffmpeg/${encodeURIComponent(ctx.version)}/${DOC_ENTRY_FILENAME}`;
+  return withVersionQuery(url, ctx.docTokens?.[DOC_ENTRY_FILENAME]);
 }
 
-function docsUrlForOption(
-  version: string,
-  optionInfo: OptionInfo | undefined,
-  docTokens?: Record<string, string>
-) {
-  const base = docsBase(version, docTokens);
+function docsUrlForOption(ctx: SelectionCtx, optionInfo: OptionInfo | undefined) {
+  const base = docsBase(ctx);
   if (!base) return undefined;
   // The extractor records each option's section anchor (or the explicit
   // ``@anchor{}`` immediately preceding the @item, when present). Use it
@@ -120,12 +81,8 @@ function docsUrlForOption(
   return base;
 }
 
-function docsUrlForFilter(
-  version: string,
-  name: string,
-  docTokens?: Record<string, string>
-) {
-  const base = docsBase(version, docTokens);
+function docsUrlForFilter(ctx: SelectionCtx, name: string) {
+  const base = docsBase(ctx);
   if (!base) return undefined;
   return `${base}#${texinfoAnchor(name.toLowerCase())}`;
 }
@@ -166,13 +123,12 @@ function buildLookup(entries: NamedEntry[]): Map<string, NamedEntry> {
 }
 
 function describeNamedEntry(
+  ctx: SelectionCtx,
   entry: NamedEntry,
   label: string,
-  version: string,
-  value: string,
-  docTokens?: Record<string, string>
+  value: string
 ): ValueEnrichment {
-  const docsBaseUrl = docsBase(version, docTokens);
+  const docsBaseUrl = docsBase(ctx);
   const docLink: SelectionDocLink | undefined = docsBaseUrl
     ? {
         label: `${label}: ${value}`,
@@ -191,38 +147,35 @@ function describeNamedEntry(
 const PROTOCOL_SCHEME_RE = /^([a-z][a-z0-9+.\-]*):(?:\/\/|[^/])/i;
 
 function enrichOptionValue(
+  ctx: SelectionCtx,
   flag: string,
   values: string[],
-  scope: "global" | "input" | "output",
-  metadata: MetadataBundle,
-  lookups: CatalogLookups,
-  version: string,
-  docTokens?: Record<string, string>
+  scope: "global" | "input" | "output"
 ): ValueEnrichment | undefined {
   if (!values.length) return undefined;
   const value = values[0];
   const lowerValue = value.toLowerCase();
   const { base } = splitStreamSpecifier(flag.toLowerCase());
+  const { lookups, metadata } = ctx;
 
   // -f <fmt>: demuxer on input, muxer on output (and either on globals when
   // the option somehow flushed to globals).
   if (base === "-f") {
     if (scope === "input") {
       const entry = lookups.demuxers.get(lowerValue);
-      if (entry) return describeNamedEntry(entry, "Demuxer", version, value, docTokens);
+      if (entry) return describeNamedEntry(ctx, entry, "Demuxer", value);
     } else if (scope === "output") {
       const entry = lookups.muxers.get(lowerValue);
-      if (entry) return describeNamedEntry(entry, "Muxer", version, value, docTokens);
+      if (entry) return describeNamedEntry(ctx, entry, "Muxer", value);
     } else {
       const entry =
         lookups.demuxers.get(lowerValue) ?? lookups.muxers.get(lowerValue);
       if (entry)
         return describeNamedEntry(
+          ctx,
           entry,
           lookups.demuxers.has(lowerValue) ? "Demuxer" : "Muxer",
-          version,
-          value,
-          docTokens
+          value
         );
     }
   }
@@ -234,10 +187,10 @@ function enrichOptionValue(
     // them (not in this change).
     const first = value.split(",")[0].trim().split("=")[0];
     const entry = lookups.bsfs.get(first.toLowerCase());
-    if (entry) return describeNamedEntry(entry, "Bitstream filter", version, first, docTokens);
+    if (entry) return describeNamedEntry(ctx, entry, "Bitstream filter", first);
   }
 
-  if (base === "-c" || base === "-codec" || base === "-vcodec" || base === "-acodec" || base === "-scodec") {
+  if (CODEC_SELECTOR_BASES.has(base)) {
     const codec = metadata.codecs.codecs.find(
       (c) => c.name.toLowerCase() === lowerValue
     );
@@ -252,7 +205,7 @@ function enrichOptionValue(
       // including multi-name sections like "libx264, libx264rgb" ⇒
       // ``libx264_002c-libx264rgb``. Codecs that only exist in allcodecs.c
       // have an empty anchor; for those, link to the page itself.
-      const docsBaseUrl = docsBase(version, docTokens);
+      const docsBaseUrl = docsBase(ctx);
       const url = docsBaseUrl
         ? codec.anchor
           ? `${docsBaseUrl}#${codec.anchor}`
@@ -271,27 +224,18 @@ function enrichOptionValue(
 }
 
 function enrichInputProtocol(
-  source: string,
-  lookups: CatalogLookups,
-  version: string,
-  docTokens?: Record<string, string>
+  ctx: SelectionCtx,
+  source: string
 ): ValueEnrichment | undefined {
   const match = PROTOCOL_SCHEME_RE.exec(source);
   if (!match) return undefined;
   const scheme = match[1].toLowerCase();
   // ``file:`` is a real protocol with its own docs section; everything else
   // that doesn't resolve probably isn't documented (e.g. a custom device).
-  const entry = lookups.protocols.get(scheme);
+  const entry = ctx.lookups.protocols.get(scheme);
   if (!entry) return undefined;
-  return describeNamedEntry(entry, "Protocol", version, scheme, docTokens);
+  return describeNamedEntry(ctx, entry, "Protocol", scheme);
 }
-
-type CatalogLookups = {
-  demuxers: Map<string, NamedEntry>;
-  muxers: Map<string, NamedEntry>;
-  protocols: Map<string, NamedEntry>;
-  bsfs: Map<string, NamedEntry>;
-};
 
 /** Human-readable label for the layer the resolver picked the option from.
  * Appears in the "Source" field of the selection popover so the user knows
@@ -323,22 +267,20 @@ function formatResolutionSource(binding: OptionBinding): string | null {
  * format entry (and its doc link) when the file carries an explicit ``-f``;
  * otherwise notes that ffmpeg auto-detects the format from the extension. */
 function buildFormatStageSelection(
+  ctx: SelectionCtx,
   kind: "demuxer" | "muxer",
-  options: OptionBinding[],
-  lookups: CatalogLookups,
-  version: string,
-  docTokens?: Record<string, string>
+  options: OptionBinding[]
 ): SelectionInfo {
   const label = kind === "demuxer" ? "Demuxer" : "Muxer";
   const fmtOpt = options.find((o) => splitStreamSpecifier(o.flag.toLowerCase()).base === "-f");
   const value = fmtOpt && fmtOpt.values.length ? fmtOpt.values[0] : null;
   if (value) {
     const entry =
-      kind === "demuxer" ? lookups.demuxers.get(value.toLowerCase()) : lookups.muxers.get(value.toLowerCase());
+      kind === "demuxer" ? ctx.lookups.demuxers.get(value.toLowerCase()) : ctx.lookups.muxers.get(value.toLowerCase());
     const description: string[] = [];
     let extraDocs: SelectionDocLink[] | undefined;
     if (entry) {
-      const enr = describeNamedEntry(entry, label, version, value, docTokens);
+      const enr = describeNamedEntry(ctx, entry, label, value);
       description.push(...enr.paragraphs);
       if (enr.docLink) extraDocs = [enr.docLink];
     }
@@ -359,14 +301,10 @@ function buildFormatStageSelection(
 }
 
 function buildOptionSelection(
+  ctx: SelectionCtx,
   scopeLabel: string,
   scope: "global" | "input" | "output",
-  binding: OptionBinding,
-  resolved: Map<string, ResolvedOption | null>,
-  metadata: MetadataBundle,
-  lookups: CatalogLookups,
-  version: string,
-  docTokens?: Record<string, string>
+  binding: OptionBinding
 ): SelectionInfo {
   const flag = binding.flag;
   const values = binding.values;
@@ -375,9 +313,8 @@ function buildOptionSelection(
   // what carries codec-private / format-private metadata that the
   // metadata.options pool by itself doesn't surface. Falls back to undefined
   // when the resolver couldn't classify the flag (unknown-option case).
-  const resolution = resolved.get(binding.tokenIds[0]) ?? null;
+  const resolution = ctx.resolved.get(binding.tokenIds[0]) ?? null;
   const optionInfo = resolution?.info;
-  const explanation = OPTION_EXPLANATIONS[base];
 
   const valueStr = values.length ? values.join(" ") : "(no value)";
   const fields: SelectionDetailItem[] = [
@@ -411,12 +348,11 @@ function buildOptionSelection(
 
   const description: string[] = [];
   if (optionInfo && optionInfo.description.length) description.push(...optionInfo.description);
-  else if (explanation) description.push(...explanation.lines);
 
-  const enrichment = enrichOptionValue(flag, values, scope, metadata, lookups, version, docTokens);
+  const enrichment = enrichOptionValue(ctx, flag, values, scope);
   if (enrichment) description.push(...enrichment.paragraphs);
 
-  const title = optionInfo?.name ?? explanation?.title ?? flag;
+  const title = optionInfo?.name ?? flag;
   const extraDocs: SelectionDocLink[] = [];
   if (enrichment?.docLink) extraDocs.push(enrichment.docLink);
 
@@ -430,8 +366,8 @@ function buildOptionSelection(
     docPath: string | undefined;
     label: string;
   }> = [
-    { family: /^libx264/, docPath: metadata.index?.x264_doc, label: "x264 reference" },
-    { family: /^libx265/, docPath: metadata.index?.x265_doc, label: "x265 reference" },
+    { family: /^libx264/, docPath: ctx.metadata.index?.x264_doc, label: "x264 reference" },
+    { family: /^libx265/, docPath: ctx.metadata.index?.x265_doc, label: "x265 reference" },
   ];
   if (binding.resolutionSource === "codec-private" && binding.matchedCodec) {
     for (const ref of upstreamRefs) {
@@ -463,7 +399,7 @@ function buildOptionSelection(
     fields,
     description,
     values: valueRows,
-    docsUrl: docsUrlForOption(version, optionInfo, docTokens),
+    docsUrl: docsUrlForOption(ctx, optionInfo),
     extraDocs: extraDocs.length ? extraDocs : undefined,
   };
 }
@@ -474,20 +410,25 @@ export function buildSelectionInfo(
   version: string,
   versionTokens?: VersionCacheTokens
 ) {
-  const docTokens = versionTokens?.doc;
   const info = new Map<string, SelectionInfo>();
-  const resolved = analysis.resolved;
   const filterLookup = new Map<string, FilterInfo>();
   metadata.filters.filters.forEach((filter) => {
     filterLookup.set(filter.name, filter);
     filter.aliases.forEach((alias) => filterLookup.set(alias, filter));
   });
 
-  const lookups: CatalogLookups = {
-    demuxers: buildLookup(metadata.demuxers?.demuxers ?? []),
-    muxers: buildLookup(metadata.muxers?.muxers ?? []),
-    protocols: buildLookup(metadata.protocols?.protocols ?? []),
-    bsfs: buildLookup(metadata.bitstreamFilters?.bitstream_filters ?? []),
+  const ctx: SelectionCtx = {
+    metadata,
+    resolved: analysis.resolved,
+    version,
+    docTokens: versionTokens?.doc,
+    filterLookup,
+    lookups: {
+      demuxers: buildLookup(metadata.demuxers?.demuxers ?? []),
+      muxers: buildLookup(metadata.muxers?.muxers ?? []),
+      protocols: buildLookup(metadata.protocols?.protocols ?? []),
+      bsfs: buildLookup(metadata.bitstreamFilters?.bitstream_filters ?? []),
+    },
   };
 
   analysis.semantic.inputs.forEach((input, index) => {
@@ -497,7 +438,7 @@ export function buildSelectionInfo(
     ];
     const description: string[] = [];
     let extraDocs: SelectionDocLink[] | undefined;
-    const protocolEnrichment = enrichInputProtocol(input.source, lookups, version, docTokens);
+    const protocolEnrichment = enrichInputProtocol(ctx, input.source);
     if (protocolEnrichment) {
       description.push(...protocolEnrichment.paragraphs);
       if (protocolEnrichment.docLink) extraDocs = [protocolEnrichment.docLink];
@@ -511,21 +452,9 @@ export function buildSelectionInfo(
     };
     info.set(input.id, sel);
     info.set(`input_${index}`, sel);
-    info.set(`demuxer_${index}`, buildFormatStageSelection("demuxer", input.options, lookups, version, docTokens));
+    info.set(`demuxer_${index}`, buildFormatStageSelection(ctx, "demuxer", input.options));
     input.options.forEach((opt) => {
-      info.set(
-        opt.id,
-        buildOptionSelection(
-          "Input-level option",
-          "input",
-          opt,
-          resolved,
-          metadata,
-          lookups,
-          version,
-          docTokens
-        )
-      );
+      info.set(opt.id, buildOptionSelection(ctx, "Input-level option", "input", opt));
     });
   });
 
@@ -540,38 +469,14 @@ export function buildSelectionInfo(
     };
     info.set(output.id, sel);
     info.set(`output_${index}`, sel);
-    info.set(`muxer_${index}`, buildFormatStageSelection("muxer", output.options, lookups, version, docTokens));
+    info.set(`muxer_${index}`, buildFormatStageSelection(ctx, "muxer", output.options));
     output.options.forEach((opt) => {
-      info.set(
-        opt.id,
-        buildOptionSelection(
-          "Output-level option",
-          "output",
-          opt,
-          resolved,
-          metadata,
-          lookups,
-          version,
-          docTokens
-        )
-      );
+      info.set(opt.id, buildOptionSelection(ctx, "Output-level option", "output", opt));
     });
   });
 
   analysis.semantic.globals.forEach((opt) => {
-    info.set(
-      opt.id,
-      buildOptionSelection(
-        "Global option",
-        "global",
-        opt,
-        resolved,
-        metadata,
-        lookups,
-        version,
-        docTokens
-      )
-    );
+    info.set(opt.id, buildOptionSelection(ctx, "Global option", "global", opt));
   });
 
   analysis.semantic.filters.forEach((filter, filterIndex) => {
@@ -601,7 +506,7 @@ export function buildSelectionInfo(
 
         chain.filters.forEach((step, stepIndex) => {
           const stepId = `${chain.id}_step_${stepIndex}`;
-          const filterInfo = filterLookup.get(step.name.toLowerCase());
+          const filterInfo = ctx.filterLookup.get(step.name.toLowerCase());
           const fields: SelectionDetailItem[] = [
             { label: "Filter", value: step.name },
             { label: "Arguments", value: String(step.args.length) },
@@ -615,7 +520,7 @@ export function buildSelectionInfo(
             detail: buildFilterStepExplanation(step.name, step.args, filterInfo),
             fields,
             description,
-            docsUrl: docsUrlForFilter(version, step.name, docTokens),
+            docsUrl: docsUrlForFilter(ctx, step.name),
           });
           step.args.forEach((arg, argIndex) => {
             const argDescription = buildFilterArgExplanation(arg.key, filterInfo);
@@ -627,7 +532,7 @@ export function buildSelectionInfo(
                 { label: "Value", value: arg.value },
               ],
               description: argDescription ? [argDescription] : [],
-              docsUrl: docsUrlForFilter(version, step.name, docTokens),
+              docsUrl: docsUrlForFilter(ctx, step.name),
             });
           });
         });

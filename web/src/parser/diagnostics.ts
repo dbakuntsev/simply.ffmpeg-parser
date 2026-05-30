@@ -1,7 +1,7 @@
 import type { Issue, MetadataBundle, SemanticCommand, Token } from "../types";
 import { nextIssueId } from "./ids";
 import { ResolvedOption, shouldExpectValue } from "./resolver";
-import { splitStreamSpecifier } from "./streamSpecifier";
+import { CODEC_SELECTOR_BASES, splitStreamSpecifier } from "./streamSpecifier";
 
 export function detectIssues(
   tokens: Token[],
@@ -125,8 +125,6 @@ export function detectIssues(
   return issues;
 }
 
-const CODEC_VALUE_BASES = new Set(["-c", "-codec", "-vcodec", "-acodec", "-scodec"]);
-
 function buildNameSet(entries: { name: string; aliases?: string[] }[] | undefined): Set<string> {
   const set = new Set<string>();
   for (const e of entries ?? []) {
@@ -161,7 +159,7 @@ function validateNamedValues(tokens: Token[], metadata: MetadataBundle): Issue[]
 
     const { base } = splitStreamSpecifier(token.normalizedText);
 
-    if (CODEC_VALUE_BASES.has(base)) {
+    if (CODEC_SELECTOR_BASES.has(base)) {
       // ``copy`` is a passthrough pseudo-codec, always valid.
       if (value.toLowerCase() === "copy") continue;
       if (codecs.size === 0) continue;
