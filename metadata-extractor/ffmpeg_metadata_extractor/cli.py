@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-from .extractor import ExtractConfig, run_extraction
+from .extractor import ALL_CATEGORIES, ExtractConfig, run_extraction
 
 
 def _default_jobs() -> int:
@@ -13,22 +13,11 @@ def _default_jobs() -> int:
     return min(8, os.cpu_count() or 1)
 
 
-_ALL_CATEGORIES = {
-    "options",
-    "codecs",
-    "filters",
-    "demuxers",
-    "muxers",
-    "protocols",
-    "bitstream_filters",
-}
-
-
 def _parse_categories(raw: str | None) -> set[str]:
     if not raw:
-        return set(_ALL_CATEGORIES)
+        return set(ALL_CATEGORIES)
     categories = {c.strip().lower() for c in raw.split(",") if c.strip()}
-    unknown = categories - _ALL_CATEGORIES
+    unknown = categories - ALL_CATEGORIES
     if unknown:
         raise argparse.ArgumentTypeError(f"Unknown categories: {', '.join(sorted(unknown))}")
     if not categories:

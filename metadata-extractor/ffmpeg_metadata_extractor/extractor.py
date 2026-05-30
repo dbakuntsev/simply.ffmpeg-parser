@@ -24,6 +24,8 @@ import concurrent.futures
 import json
 import multiprocessing
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -83,7 +85,7 @@ from .upstream_enrich import (
 )
 from .upstream_help import UpstreamOptionHelp
 
-__all__ = ["ExtractConfig", "ExtractionError", "run_extraction"]
+__all__ = ["ALL_CATEGORIES", "ExtractConfig", "ExtractionError", "run_extraction"]
 
 
 def _pool_initializer(log_queue, upstream_doc_lock) -> None:
@@ -572,6 +574,157 @@ def _write_json(path: Path, payload: dict | list) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
+# --- per-category emit registry -------------------------------------------
+#
+# Each category in :data:`_CATEGORY_EMITTERS` is one ``<category>.json`` file
+# the SPA loads when its bundle is selected. The triple is
+# ``(name, output_filename, emit_fn)``; the emit function reads every input
+# it needs from the per-tag :class:`_ExtractContext` and writes its JSON to
+# ``ctx.output_dir / filename``. The same registry drives both the
+# extract-and-write loop (in :func:`_extract_and_write`) and the
+# ``index.json`` advertisement table (in :func:`_build_index`), so adding a
+# new category is one entry rather than three edits.
+
+
+@dataclass(frozen=True)
+class _ExtractContext:
+    """Per-tag bundle threaded through every category emitter.
+
+    Frozen at the field level — fields cannot be reassigned — but the
+    mutable containers (``xml_cache``, ``c_map``) are still mutable in
+    place so memoization across emitters works as before.
+    """
+
+    config: ExtractConfig
+    tag: str
+    target_version: str
+    makeinfo_cmd: list[str]
+    logger: Logger
+    doc_root: Path
+    fallback_root: Path | None
+    c_map: dict[str, list[ParsedOption]]
+    xml_cache: dict[str, ET.Element | None]
+    x264_help: dict[str, UpstreamOptionHelp]
+    x265_help: dict[str, UpstreamOptionHelp]
+    output_dir: Path
+
+
+def _emit_options(ctx: _ExtractContext) -> None:
+    options = _extract_options(
+        ctx.doc_root, ctx.config.repo, ctx.tag, ctx.fallback_root,
+        ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _write_json(ctx.output_dir / "options.json", {"options": options})
+
+
+def _emit_codecs(ctx: _ExtractContext) -> None:
+    # codecs.json bundles two distinct things: the per-codec list (with
+    # upstream x264/x265 overlays already applied) and the generic AVCodec
+    # option table. They live in one file because the SPA loads them
+    # together.
+    codecs = _extract_codecs(
+        ctx.doc_root, ctx.config.repo, ctx.tag, ctx.fallback_root,
+        ctx.makeinfo_cmd, ctx.logger,
+        ctx.c_map, ctx.xml_cache, ctx.x264_help, ctx.x265_help,
+    )
+    codec_options = _extract_codec_options(
+        ctx.doc_root, ctx.makeinfo_cmd, ctx.logger, ctx.c_map, ctx.xml_cache,
+    )
+    _write_json(
+        ctx.output_dir / "codecs.json",
+        {"codec_options": codec_options, "codecs": codecs},
+    )
+
+
+def _emit_filters(ctx: _ExtractContext) -> None:
+    filters = _extract_filters(
+        ctx.doc_root, ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _write_json(ctx.output_dir / "filters.json", {"filters": filters})
+
+
+def _emit_demuxers(ctx: _ExtractContext) -> None:
+    demuxers = _extract_named(
+        ctx.doc_root, "demuxers.texi", parse_demuxers_xml, "demuxers",
+        ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _attach_per_format_options(
+        demuxers, ctx.doc_root, "demuxers.texi", "demuxer",
+        ctx.makeinfo_cmd, ctx.logger, ctx.c_map, ctx.xml_cache,
+    )
+    # Input devices are selected with the same ``-f`` flag as demuxers
+    # (libavdevice exposes them as demuxers at runtime), so they're merged
+    # into the demuxers bundle. Without this the SPA emits a spurious
+    # ``unknown-demuxer`` warning for ``-f lavfi`` etc.
+    indevs = _extract_named(
+        ctx.doc_root, "indevs.texi", parse_input_devices_xml,
+        "input devices", ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    demuxers = _merge_named_dicts(demuxers, indevs)
+    _write_json(ctx.output_dir / "demuxers.json", {"demuxers": demuxers})
+
+
+def _emit_muxers(ctx: _ExtractContext) -> None:
+    muxers = _extract_named(
+        ctx.doc_root, "muxers.texi", parse_muxers_xml, "muxers",
+        ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _attach_per_format_options(
+        muxers, ctx.doc_root, "muxers.texi", "muxer",
+        ctx.makeinfo_cmd, ctx.logger, ctx.c_map, ctx.xml_cache,
+    )
+    outdevs = _extract_named(
+        ctx.doc_root, "outdevs.texi", parse_output_devices_xml,
+        "output devices", ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    muxers = _merge_named_dicts(muxers, outdevs)
+    format_options = _extract_format_options(
+        ctx.doc_root, ctx.makeinfo_cmd, ctx.logger, ctx.c_map, ctx.xml_cache,
+    )
+    _write_json(
+        ctx.output_dir / "muxers.json",
+        {"format_options": format_options, "muxers": muxers},
+    )
+
+
+def _emit_protocols(ctx: _ExtractContext) -> None:
+    protocols = _extract_named(
+        ctx.doc_root, "protocols.texi", parse_protocols_xml, "protocols",
+        ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _write_json(ctx.output_dir / "protocols.json", {"protocols": protocols})
+
+
+def _emit_bitstream_filters(ctx: _ExtractContext) -> None:
+    bsfs = _extract_named(
+        ctx.doc_root, "bitstream_filters.texi", parse_bitstream_filters_xml,
+        "bitstream_filters", ctx.makeinfo_cmd, ctx.logger, ctx.xml_cache,
+    )
+    _write_json(
+        ctx.output_dir / "bitstream_filters.json",
+        {"bitstream_filters": bsfs},
+    )
+
+
+# Order matters: emitters run in this order, which controls the per-tag log
+# sequence and the field order in the generated ``index.json``.
+_CATEGORY_EMITTERS: tuple[
+    tuple[str, str, Callable[[_ExtractContext], None]], ...
+] = (
+    ("options",           "options.json",           _emit_options),
+    ("codecs",            "codecs.json",            _emit_codecs),
+    ("filters",           "filters.json",           _emit_filters),
+    ("demuxers",          "demuxers.json",          _emit_demuxers),
+    ("muxers",            "muxers.json",            _emit_muxers),
+    ("protocols",         "protocols.json",         _emit_protocols),
+    ("bitstream_filters", "bitstream_filters.json", _emit_bitstream_filters),
+)
+
+# Public surface for ``cli.py``: the set of valid ``--categories`` values.
+# Derived from the registry so adding a category in one place is sufficient.
+ALL_CATEGORIES: frozenset[str] = frozenset(name for name, _file, _fn in _CATEGORY_EMITTERS)
+
+
 def _build_index(
     version: str,
     released: str | None,
@@ -594,20 +747,9 @@ def _build_index(
     # Only advertise files this run actually produced. Older bundles on disk
     # carried only options/codecs/filters; the SPA must tolerate the absence
     # of the value-lookup keys, which is exactly what omitting them signals.
-    if "options" in categories:
-        index["options"] = "options.json"
-    if "codecs" in categories:
-        index["codecs"] = "codecs.json"
-    if "filters" in categories:
-        index["filters"] = "filters.json"
-    if "demuxers" in categories:
-        index["demuxers"] = "demuxers.json"
-    if "muxers" in categories:
-        index["muxers"] = "muxers.json"
-    if "protocols" in categories:
-        index["protocols"] = "protocols.json"
-    if "bitstream_filters" in categories:
-        index["bitstream_filters"] = "bitstream_filters.json"
+    for name, filename, _emit in _CATEGORY_EMITTERS:
+        if name in categories:
+            index[name] = filename
     # Path is relative to the SPA's public root (``web/public/``), not
     # to this index.json's directory — the file lives in a sibling tree
     # (``doc/x264/<commit>/``) keyed on x264 commit so multiple FFmpeg
@@ -687,88 +829,23 @@ def _extract_and_write(
         x264_help, x264_doc_path = enrich_x264(config, released, logger)
         x265_help, x265_doc_path = enrich_x265(config, released, logger)
 
-        if "options" in config.categories:
-            options = _extract_options(
-                doc_root, config.repo, tag, fallback_root,
-                makeinfo_cmd, logger, xml_cache,
-            )
-            _write_json(output_dir / "options.json", {"options": options})
-
-        if "codecs" in config.categories:
-            codecs = _extract_codecs(
-                doc_root, config.repo, tag, fallback_root, makeinfo_cmd, logger,
-                c_map, xml_cache, x264_help, x265_help,
-            )
-            codec_options = _extract_codec_options(
-                doc_root, makeinfo_cmd, logger, c_map, xml_cache,
-            )
-            _write_json(
-                output_dir / "codecs.json",
-                {"codec_options": codec_options, "codecs": codecs},
-            )
-
-        if "filters" in config.categories:
-            filters = _extract_filters(doc_root, makeinfo_cmd, logger, xml_cache)
-            _write_json(output_dir / "filters.json", {"filters": filters})
-
-        if "demuxers" in config.categories:
-            demuxers = _extract_named(
-                doc_root, "demuxers.texi", parse_demuxers_xml, "demuxers",
-                makeinfo_cmd, logger, xml_cache,
-            )
-            _attach_per_format_options(
-                demuxers, doc_root, "demuxers.texi", "demuxer",
-                makeinfo_cmd, logger, c_map, xml_cache,
-            )
-            # Input devices are selected with the same ``-f`` flag as demuxers
-            # (libavdevice exposes them as demuxers at runtime), so they're
-            # merged into the demuxers bundle. Without this the SPA emits a
-            # spurious ``unknown-demuxer`` warning for ``-f lavfi`` etc.
-            indevs = _extract_named(
-                doc_root, "indevs.texi", parse_input_devices_xml,
-                "input devices", makeinfo_cmd, logger, xml_cache,
-            )
-            demuxers = _merge_named_dicts(demuxers, indevs)
-            _write_json(output_dir / "demuxers.json", {"demuxers": demuxers})
-
-        if "muxers" in config.categories:
-            muxers = _extract_named(
-                doc_root, "muxers.texi", parse_muxers_xml, "muxers",
-                makeinfo_cmd, logger, xml_cache,
-            )
-            _attach_per_format_options(
-                muxers, doc_root, "muxers.texi", "muxer",
-                makeinfo_cmd, logger, c_map, xml_cache,
-            )
-            outdevs = _extract_named(
-                doc_root, "outdevs.texi", parse_output_devices_xml,
-                "output devices", makeinfo_cmd, logger, xml_cache,
-            )
-            muxers = _merge_named_dicts(muxers, outdevs)
-            format_options = _extract_format_options(
-                doc_root, makeinfo_cmd, logger, c_map, xml_cache,
-            )
-            _write_json(
-                output_dir / "muxers.json",
-                {"format_options": format_options, "muxers": muxers},
-            )
-
-        if "protocols" in config.categories:
-            protocols = _extract_named(
-                doc_root, "protocols.texi", parse_protocols_xml, "protocols",
-                makeinfo_cmd, logger, xml_cache,
-            )
-            _write_json(output_dir / "protocols.json", {"protocols": protocols})
-
-        if "bitstream_filters" in config.categories:
-            bsfs = _extract_named(
-                doc_root, "bitstream_filters.texi", parse_bitstream_filters_xml,
-                "bitstream_filters", makeinfo_cmd, logger, xml_cache,
-            )
-            _write_json(
-                output_dir / "bitstream_filters.json",
-                {"bitstream_filters": bsfs},
-            )
+        ctx = _ExtractContext(
+            config=config,
+            tag=tag,
+            target_version=target_version,
+            makeinfo_cmd=makeinfo_cmd,
+            logger=logger,
+            doc_root=doc_root,
+            fallback_root=fallback_root,
+            c_map=c_map,
+            xml_cache=xml_cache,
+            x264_help=x264_help,
+            x265_help=x265_help,
+            output_dir=output_dir,
+        )
+        for name, _filename, emit in _CATEGORY_EMITTERS:
+            if name in config.categories:
+                emit(ctx)
 
         if config.html_doc:
             generate_html_doc(
