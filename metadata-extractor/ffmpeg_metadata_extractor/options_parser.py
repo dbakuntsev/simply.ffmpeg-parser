@@ -6,11 +6,20 @@ classifying each as global/input/output by section title, and emits one
 enum-value helpers (:func:`classify_value_type`, :func:`extract_enum_values`)
 are public to the package because the AVOption variants reuse the exact
 same shape recognition.
+
+This module also exposes :func:`iter_item_heads` and
+:func:`render_entry_body` — the two pieces of scaffolding the three
+"entry → OptionEntry" builders share. Variants differ in how they
+extract names from the head text, how they default and update
+``value_type``, and (for AVCodec) whether they read role tags; everything
+else is shared.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
 from .models import OptionEntry
@@ -132,6 +141,93 @@ def extract_enum_values(entry: ET.Element) -> list[str]:
     return []
 
 
+# --- Shared "entry → typed option" scaffolding ------------------------
+#
+# All three entry builders (driver options, generic AVOptions, per-codec
+# private AVOptions) share the same outer shape:
+#
+#   1. Iterate <tableterm>/<item|itemx> rows; bail if there are none.
+#   2. Per row: extract names from the head text, contribute to
+#      ``value_type``, collect the documented signature, (optionally) read
+#      role tags from <emph> children.
+#   3. Bail if no names were collected.
+#   4. Render the description paragraphs from <tableitem> children.
+#   5. Pull enum/flag values from a nested ``@table @samp`` and promote
+#      ``value_type`` to "enum" when applicable.
+#
+# Steps 1, 4, 5 are identical across variants; only step 2 differs
+# (regex flavor, default ``value_type``, override policy, role handling).
+# :func:`iter_item_heads` and :func:`render_entry_body` capture steps 1
+# and 4+5; each variant supplies its own step-2 loop body.
+
+
+@dataclass(frozen=True)
+class ItemHead:
+    """Per-item view used by every entry-builder variant.
+
+    ``fmt`` is the ``<itemformat>`` child (may be ``None`` when the
+    ``<item>`` is bare text — driver options accept that case, the
+    AVOption variants skip such rows). ``head_for_names`` is the text
+    before the first ``(`` — option names always appear there, so this
+    pre-strips the scope/role parenthetical (e.g. ``(input/output,per-stream)``
+    or ``(@code{-V})``) that would otherwise pollute name extraction.
+    ``signature`` is the whitespace-collapsed full head, used verbatim as
+    the documented invocation form.
+    """
+
+    fmt: ET.Element | None
+    head_text: str
+    head_for_names: str
+    signature: str
+
+
+def iter_item_heads(entry: ET.Element) -> Iterator[ItemHead]:
+    """Yield one :class:`ItemHead` per ``<tableterm>``/``<item|itemx>``
+    in ``entry``.
+
+    Callers iterate this once and supply their own variant-specific name
+    extraction + value-type policy on each yielded head. The text
+    extraction, parenthetical strip, and signature collapse are uniform
+    across variants and live here.
+    """
+    for item in entry.findall("tableterm/item") + entry.findall("tableterm/itemx"):
+        fmt = item.find("itemformat")
+        if fmt is not None:
+            head_text = plain_text(fmt)
+            signature = " ".join(head_text.split())
+        else:
+            head_text = item.text or ""
+            signature = ""
+        head_for_names = head_text.split("(", 1)[0].strip()
+        yield ItemHead(
+            fmt=fmt,
+            head_text=head_text,
+            head_for_names=head_for_names,
+            signature=signature,
+        )
+
+
+def render_entry_body(
+    entry: ET.Element, value_type: str
+) -> tuple[list[str], list[str], str]:
+    """Render the entry's description paragraphs and enum value list.
+
+    Returns ``(description_paragraphs, values, final_value_type)``. The
+    returned ``final_value_type`` is the input ``value_type`` promoted to
+    ``"enum"`` when a value list is present and the current type isn't
+    ``"flags"`` (which keeps its tag because ``flags`` accepts ``+a+b``
+    combinations rather than a single enum match — but still surfaces the
+    documented value set).
+    """
+    description_paragraphs: list[str] = []
+    for item in entry.findall("tableitem"):
+        description_paragraphs.extend(render_paragraphs(item))
+    values = extract_enum_values(entry)
+    if values and value_type != "flags":
+        value_type = "enum"
+    return description_paragraphs, values, value_type
+
+
 def _scope_for_section(title: str, current: str) -> str:
     lower = title.lower()
     if "input" in lower:
@@ -174,60 +270,35 @@ def _extract_options_from_section(
 def _option_from_entry(
     entry: ET.Element, scope: str, anchor: str
 ) -> OptionEntry | None:
-    items = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
-    if not items:
+    heads = list(iter_item_heads(entry))
+    if not heads:
         return None
 
     names: list[str] = []
     value_type: str = "none"
     signatures: list[str] = []
-    for item in items:
-        fmt = item.find("itemformat")
-        # Use the full plain text of <itemformat> for name extraction so that
-        # alias forms after the first ``<var>`` child (e.g.
-        # ``-loglevel [<var>flags</var>+]<var>loglevel</var> | -v [<var>flags</var>+]…``)
-        # are still seen by the regex. ``fmt.text`` alone stops at the first
-        # element child and drops every name after it.
-        head = plain_text(fmt) if fmt is not None else (item.text or "")
-        # Strip the trailing role/scope parenthetical (e.g.
-        # ``(input/output,per-stream)`` or ``(@code{-V})``) before scanning for
-        # option names — the regex would otherwise see ``-stream`` inside
-        # ``per-stream`` or ``-V`` inside the parenthetical and emit them as
-        # spurious aliases. Names always appear before the first ``(``.
-        head_for_names = head.split("(", 1)[0] if head else head
-        for name in _OPTION_NAME_RE.findall(head_for_names or ""):
+    for head in heads:
+        # Use the full plain text of <itemformat> (head.head_for_names) for
+        # name extraction so that alias forms after the first ``<var>`` child
+        # (e.g. ``-loglevel [<var>flags</var>+]<var>loglevel</var> | -v
+        # [<var>flags</var>+]…``) are still seen by the regex.
+        for name in _OPTION_NAME_RE.findall(head.head_for_names):
             names.append(normalize_name(name))
-        if fmt is not None:
-            classified = classify_value_type(fmt)
+        if head.fmt is not None:
+            classified = classify_value_type(head.fmt)
             if classified is not None and value_type == "none":
                 value_type = classified
-            elif "=" in (fmt.text or "") and value_type == "none":
+            elif "=" in (head.fmt.text or "") and value_type == "none":
                 # Items like ``-define key=value`` carry a value via the
                 # ``=`` literal even when no ``@var`` is present.
                 value_type = "string"
-            # Render the documented signature with @var/@emph stripped — the
-            # raw text preserves the bracket grammar (``[-]input_file_id``,
-            # ``[:stream_specifier]``) which the description prose references
-            # by name. Collapse internal whitespace so makeinfo's line wraps
-            # don't survive into the JSON.
-            sig = " ".join(plain_text(fmt).split())
-            if sig:
-                signatures.append(sig)
+            if head.signature:
+                signatures.append(head.signature)
 
     if not names:
         return None
 
-    description_paragraphs: list[str] = []
-    for item in entry.findall("tableitem"):
-        description_paragraphs.extend(render_paragraphs(item))
-
-    # Promote to ``enum`` when the description carries an ``@table @samp``
-    # value list. ``flags``-typed options keep their type tag (they accept
-    # ``+a+b`` combinations rather than a single enum match) but still
-    # surface the documented value set.
-    values = extract_enum_values(entry)
-    if values and value_type not in ("flags",):
-        value_type = "enum"
+    description_paragraphs, values, value_type = render_entry_body(entry, value_type)
 
     return OptionEntry(
         name=names[0],
@@ -276,7 +347,10 @@ def parse_options_xml(root: ET.Element) -> list[OptionEntry]:
 
 
 __all__ = [
+    "ItemHead",
     "classify_value_type",
     "extract_enum_values",
+    "iter_item_heads",
     "parse_options_xml",
+    "render_entry_body",
 ]

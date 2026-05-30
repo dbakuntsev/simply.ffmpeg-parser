@@ -18,9 +18,10 @@ than a global / input / output scope:
 Plus :func:`merge_per_codec_options`, which unions the encoder-side and
 decoder-side per-codec tables.
 
-Reuses :func:`classify_value_type` / :func:`extract_enum_values` from
-:mod:`.options_parser` and :func:`codec_aliases_from_title` from
-:mod:`.codecs_parser`.
+Reuses :func:`classify_value_type` from :mod:`.options_parser` plus the
+shared ``iter_item_heads`` / ``render_entry_body`` scaffolding that the
+driver-option builder also uses; reuses
+:func:`codec_aliases_from_title` from :mod:`.codecs_parser`.
 """
 
 from __future__ import annotations
@@ -31,8 +32,12 @@ from xml.etree import ElementTree as ET
 
 from .codecs_parser import codec_aliases_from_title
 from .models import AVOptionEntry
-from .options_parser import classify_value_type, extract_enum_values
-from .texi_markdown import plain_text, render_paragraphs
+from .options_parser import (
+    classify_value_type,
+    iter_item_heads,
+    render_entry_body,
+)
+from .texi_markdown import plain_text
 from .texi_traversal import (
     SECTION_TAGS,
     normalize_name,
@@ -80,13 +85,13 @@ def _av_option_from_entry(
     """Build an :class:`AVOptionEntry` from one ``<tableentry>`` inside an
     AVCodec / AVFormat option table.
 
-    Reuses the value-type and enum helpers from the driver-option path.
     Names come without a leading ``-`` in the docs (``@item b @var{integer}``);
     the leading dash is added on emit so the SPA can resolve the option from
-    the command-line form (``-b``).
+    the command-line form (``-b``). Items with no ``<itemformat>`` child are
+    skipped — bare-text rows aren't AVOption shape.
     """
-    items = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
-    if not items:
+    heads = list(iter_item_heads(entry))
+    if not heads:
         return None
 
     names: list[str] = []
@@ -94,38 +99,28 @@ def _av_option_from_entry(
     signatures: list[str] = []
     roles: list[str] = []
 
-    for item in items:
-        fmt = item.find("itemformat")
-        if fmt is None:
+    for head in heads:
+        if head.fmt is None:
             continue
-        head = plain_text(fmt)
-        head_for_name = head.split("(", 1)[0].strip()
-        match = _AV_OPTION_NAME_RE.match(head_for_name)
+        match = _AV_OPTION_NAME_RE.match(head.head_for_names)
         if match:
             names.append(f"-{normalize_name(match.group(1))}")
 
-        classified = classify_value_type(fmt)
+        classified = classify_value_type(head.fmt)
         if classified is not None and value_type == "none":
             value_type = classified
 
-        sig = " ".join(head.split())
-        if sig:
-            signatures.append(sig)
+        if head.signature:
+            signatures.append(head.signature)
 
-        for role in _av_option_roles(fmt, allowed_roles):
+        for role in _av_option_roles(head.fmt, allowed_roles):
             if role not in roles:
                 roles.append(role)
 
     if not names:
         return None
 
-    description_paragraphs: list[str] = []
-    for item in entry.findall("tableitem"):
-        description_paragraphs.extend(render_paragraphs(item))
-
-    values = extract_enum_values(entry)
-    if values and value_type not in ("flags",):
-        value_type = "enum"
+    description_paragraphs, values, value_type = render_entry_body(entry, value_type)
 
     # Normalize role spelling: the docs use both ``subtitle`` and ``subtitles``;
     # collapse to the singular so callers can match a single key.
@@ -247,46 +242,36 @@ def _per_codec_option_from_entry(
        Default to ``"string"`` here; tighten only when a ``@var`` is present
        *and* hints at a stronger scalar type.
     """
-    items = entry.findall("tableterm/item") + entry.findall("tableterm/itemx")
-    if not items:
+    heads = list(iter_item_heads(entry))
+    if not heads:
         return None
 
     names: list[str] = []
     value_type = "string"  # encoders.texi default — most items take values.
     signatures: list[str] = []
 
-    for item in items:
-        fmt = item.find("itemformat")
-        if fmt is None:
+    for head in heads:
+        if head.fmt is None:
             continue
-        head = plain_text(fmt)
-        head_for_name = head.split("(", 1)[0].strip()
         # ac3 / a few others write ``@item -per_frame_metadata @var{boolean}``;
         # strip the leading dash before matching so the regex (which expects
         # an alpha lead char) succeeds either way.
-        name_text = head_for_name.lstrip("-")
+        name_text = head.head_for_names.lstrip("-")
         match = _AV_OPTION_NAME_RE.match(name_text)
         if match:
             names.append(f"-{normalize_name(match.group(1))}")
 
-        classified = classify_value_type(fmt)
+        classified = classify_value_type(head.fmt)
         if classified is not None and classified != "string":
             value_type = classified
 
-        sig = " ".join(head.split())
-        if sig:
-            signatures.append(sig)
+        if head.signature:
+            signatures.append(head.signature)
 
     if not names:
         return None
 
-    description_paragraphs: list[str] = []
-    for item in entry.findall("tableitem"):
-        description_paragraphs.extend(render_paragraphs(item))
-
-    values = extract_enum_values(entry)
-    if values and value_type not in ("flags",):
-        value_type = "enum"
+    description_paragraphs, values, value_type = render_entry_body(entry, value_type)
 
     return AVOptionEntry(
         name=names[0],
