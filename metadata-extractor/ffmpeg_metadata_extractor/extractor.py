@@ -24,6 +24,7 @@ from .avopt_c import (
     enrich_options_with_c_values,
 )
 from .config_texi import generate_config_texi
+from .options_c import apply_alias_map, build_alias_map
 from .git_utils import (
     commit_at_or_before,
     list_tags,
@@ -503,6 +504,9 @@ def _load_text(repo: Path, tag: str, path: str, fallback_root: Path | None) -> s
 
 def _extract_options(
     doc_root: Path,
+    repo: Path,
+    tag: str,
+    fallback_root: Path | None,
     makeinfo_cmd: list[str],
     logger: Logger,
     xml_cache: dict[str, ET.Element | None],
@@ -513,7 +517,7 @@ def _extract_options(
             continue
         logger.debug(f"Parsing options from {source}")
         options = dedupe_options(parse_options_xml(root))
-        return [
+        out: list[dict] = [
             {
                 "name": o.name,
                 "aliases": o.aliases,
@@ -528,7 +532,59 @@ def _extract_options(
             }
             for o in options
         ]
+        _augment_aliases_from_c(out, repo, tag, fallback_root, logger)
+        return out
     raise ExtractionError("Options sources not found")
+
+
+# Files searched (in order) for the ``OptionDef`` table and the
+# ``CMDUTILS_COMMON_OPTIONS`` macro. Both names of the common-options header
+# appear across the supported tag range: ``opt_common.h`` is the current
+# location; ``cmdutils.h`` was its home in older tags (pre-n6 roughly). All
+# are best-effort — missing files just contribute nothing to the alias map.
+_OPTIONS_C_SOURCES = (
+    "fftools/ffmpeg_opt.c",
+    "fftools/opt_common.h",
+    "fftools/cmdutils.h",
+)
+
+
+def _augment_aliases_from_c(
+    options: list[dict],
+    repo: Path,
+    tag: str,
+    fallback_root: Path | None,
+    logger: Logger,
+) -> None:
+    """Fold undocumented option aliases from ``fftools/`` C sources into
+    ``options`` in place.
+
+    Many short/legacy alternatives (e.g. ``-apre``/``-vpre``/``-spre`` for
+    ``-pre``, ``-stag`` for ``-tag``, ``-lavfi`` for ``-filter_complex`` on
+    older tags) share a backing handler with a documented option in
+    ``fftools/ffmpeg_opt.c`` but never get their own texi entry. Without
+    this pass, the SPA flags them as ``unknown-option``. The C-source
+    parser is best-effort: a tag where every file fails to fetch just
+    leaves the doc-derived aliases unchanged.
+    """
+    sources: dict[str, str] = {}
+    for path in _OPTIONS_C_SOURCES:
+        text = _load_text(repo, tag, path, fallback_root)
+        if text:
+            sources[path] = text
+    if not sources:
+        logger.debug("No fftools C sources available for alias augmentation")
+        return
+    documented = {o["name"] for o in options}
+    alias_map = build_alias_map(sources, documented)
+    if not alias_map:
+        return
+    added = apply_alias_map(options, alias_map)
+    if added:
+        logger.debug(
+            f"Augmented options.json with {added} aliases from "
+            f"{', '.join(sources)}"
+        )
 
 
 _X264_FAMILY = frozenset({"libx264", "libx264rgb", "libx262"})
@@ -1184,7 +1240,10 @@ def _extract_and_write(
                         )
 
         if "options" in config.categories:
-            options = _extract_options(doc_root, makeinfo_cmd, logger, xml_cache)
+            options = _extract_options(
+                doc_root, config.repo, tag, fallback_root,
+                makeinfo_cmd, logger, xml_cache,
+            )
             _write_json(output_dir / "options.json", {"options": options})
 
         if "codecs" in config.categories:

@@ -97,7 +97,8 @@ export function buildSemantic(
         if (
           token.normalizedText === "-vf" ||
           token.normalizedText === "-af" ||
-          token.normalizedText === "-filter_complex"
+          token.normalizedText === "-filter_complex" ||
+          token.normalizedText === "-lavfi"
         ) {
           const chains = parseFilterComplex(value.text);
           filterGraphs.push({ id: `filter_${filterGraphs.length}`, expression: value.text, chains, valueTokenId: value.id });
