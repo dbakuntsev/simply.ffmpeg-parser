@@ -23,22 +23,13 @@ ffmpeg-metadata-extract --repo /repos/ffmpeg --tags n7.1.2 --out ./dist
 ffmpeg-metadata-extract --repo /repos/ffmpeg --range n6.1.0..n7.1.2 --out ./dist
 ```
 
-## HTML documentation
-
-In addition to the JSON metadata under `<out>/metadata/ffmpeg/<version>/`, the
-extractor renders a single-page HTML reference (`ffmpeg-all.html`) per version
-under `<out>/doc/ffmpeg/<version>/`, generated from each tag's `doc/ffmpeg.texi`
-via GNU `makeinfo --html --no-split`. The synthetic `doc/config.texi` we
-already write into the staged docs forces `config-all`, so the rendered page
-includes the complete reference (options, codecs, filters, formats, …) for
-that version. Pass `--disable-html-doc` to skip this step.
-
-The two CSS files (`bootstrap.min.css`, `style.min.css`) referenced by every
-generated page live **once** at `<out>/doc/ffmpeg/`, shared by all versions.
-Each per-version HTML links to them via `../bootstrap.min.css` and
-`../style.min.css`.
-
 ## HTML rendering assets (fetched at build time)
+
+> The top-level [`../METADATA_EXTRACTOR.md`](../METADATA_EXTRACTOR.md)
+> covers *what* the HTML rendering step produces (`ffmpeg-all.html` per
+> version under `<out>/doc/ffmpeg/`, shared CSS one level up). This
+> section is the *why* and *how* — the part a future maintainer needs
+> when bumping the pinned tag or debugging a silent makeinfo failure.
 
 The HTML renderer needs three files from FFmpeg's `doc/` tree:
 
@@ -53,8 +44,7 @@ build time via `git show <tag>:doc/<file>` (`_pinned_asset_bytes` in
 `extractor.py`) and written into the staged docs / output. This keeps the
 package **100% MIT**: `t2h.pm` carries an FFmpeg GPLv3+ header, and the project
 rule is that GPL-derived artifacts are generated at build time and never
-checked in. The CSS pair lands once at `<out>/doc/ffmpeg/`, shared by every
-version, which links to it via `../bootstrap.min.css` / `../style.min.css`.
+checked in.
 
 ### The pinned tag
 
