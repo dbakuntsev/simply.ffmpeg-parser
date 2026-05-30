@@ -6,7 +6,8 @@ export function tokenize(command: string): Token[] {
   let i = 0;
   let current = "";
   let start = 0;
-  let inQuotes = false;
+  let inDouble = false;
+  let inSingle = false;
   let escape = false;
 
   const pushToken = (text: string, startIndex: number, endIndex: number) => {
@@ -55,6 +56,16 @@ export function tokenize(command: string): Token[] {
 
   while (i < command.length) {
     const ch = command[i];
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+        i += 1;
+        continue;
+      }
+      current += ch;
+      i += 1;
+      continue;
+    }
     if (escape) {
       current += ch;
       escape = false;
@@ -67,11 +78,16 @@ export function tokenize(command: string): Token[] {
       continue;
     }
     if (ch === '"') {
-      inQuotes = !inQuotes;
+      inDouble = !inDouble;
       i += 1;
       continue;
     }
-    if (!inQuotes && /\s/.test(ch)) {
+    if (!inDouble && ch === "'") {
+      inSingle = true;
+      i += 1;
+      continue;
+    }
+    if (!inDouble && /\s/.test(ch)) {
       pushToken(current, start, i);
       current = "";
       i += 1;

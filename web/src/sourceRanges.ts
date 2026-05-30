@@ -13,8 +13,18 @@ function tokenTextToSourceMap(command: string, token: Token): number[] {
   const map: number[] = [];
   const { start, end } = token.sourceRange;
   let escape = false;
+  let inDouble = false;
+  let inSingle = false;
   for (let p = start; p < end && p < command.length; p += 1) {
     const ch = command[p];
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+        continue;
+      }
+      map.push(p);
+      continue;
+    }
     if (escape) {
       map.push(p);
       escape = false;
@@ -24,7 +34,14 @@ function tokenTextToSourceMap(command: string, token: Token): number[] {
       escape = true;
       continue;
     }
-    if (ch === '"') continue; // quote is consumed, not part of the text
+    if (ch === '"') {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      inSingle = true;
+      continue;
+    }
     map.push(p);
   }
   return map;
