@@ -122,11 +122,49 @@ function buildGeometry(model: PipelineModel) {
   // right, down through a clear cross-over lane below the boxes, and back up
   // into the target's left edge. All vertical/horizontal runs stay in box-free
   // channels, so no rail ever passes under a box.
+  //
+  // To avoid horizontal-segment overlap when a single box has multiple rails on
+  // the same side, we fan out attachment points along the box edge (outgoing
+  // along the right edge, incoming along the left). Slot order is chosen so the
+  // rail ends roughly match the vertical order of the *other* endpoints — i.e.
+  // a topmost target receives from a topmost slot — which minimizes crossings.
   const colOf = (stage: PipelineStage) => cols.indexOf(stage);
-  type Item = { e: PipelineEdge; s: Placed; t: Placed };
-  const items: Item[] = model.edges
+  type Item = { e: PipelineEdge; s: Placed; t: Placed; y1: number; y2: number };
+  const rawItems = model.edges
     .map((e) => ({ e, s: placed.get(e.source)!, t: placed.get(e.target)! }))
     .filter((it) => it.s && it.t);
+
+  // Fan-out / fan-in slot assignment per box.
+  const outBy = new Map<string, typeof rawItems>();
+  const inBy = new Map<string, typeof rawItems>();
+  for (const it of rawItems) {
+    (outBy.get(it.s.id) ?? outBy.set(it.s.id, []).get(it.s.id)!).push(it);
+    (inBy.get(it.t.id) ?? inBy.set(it.t.id, []).get(it.t.id)!).push(it);
+  }
+  for (const arr of outBy.values()) {
+    arr.sort((a, b) => a.t.y + a.t.h / 2 - (b.t.y + b.t.h / 2));
+  }
+  for (const arr of inBy.values()) {
+    arr.sort((a, b) => a.s.y + a.s.h / 2 - (b.s.y + b.s.h / 2));
+  }
+  const outSlot = new Map<(typeof rawItems)[number], { idx: number; count: number }>();
+  const inSlot = new Map<(typeof rawItems)[number], { idx: number; count: number }>();
+  for (const arr of outBy.values()) arr.forEach((it, idx) => outSlot.set(it, { idx, count: arr.length }));
+  for (const arr of inBy.values()) arr.forEach((it, idx) => inSlot.set(it, { idx, count: arr.length }));
+
+  const ATTACH_PAD = 10; // keep attach points clear of box corners
+  const attachY = (box: Placed, slot: { idx: number; count: number }) => {
+    if (slot.count <= 1) return box.y + box.h / 2;
+    const top = box.y + ATTACH_PAD;
+    const bot = box.y + box.h - ATTACH_PAD;
+    return top + ((bot - top) * slot.idx) / (slot.count - 1);
+  };
+
+  const items: Item[] = rawItems.map((it) => ({
+    ...it,
+    y1: attachY(it.s, outSlot.get(it)!),
+    y2: attachY(it.t, inSlot.get(it)!),
+  }));
 
   const forward = new Map<number, Item[]>();
   const side = new Map<number, Item[]>();
@@ -138,13 +176,14 @@ function buildGeometry(model: PipelineModel) {
   const edges: RoutedEdge[] = [];
 
   for (const group of forward.values()) {
+    // Order lane assignment by the rail's mean y so adjacent lanes carry
+    // adjacent rails — minimizes crossings within the column gap.
+    group.sort((a, b) => a.y1 + a.y2 - (b.y1 + b.y2));
     const n = group.length;
     group.forEach((it, i) => {
-      const { s, t } = it;
+      const { s, t, y1, y2 } = it;
       const x1 = s.x + s.w;
-      const y1 = s.y + s.h / 2;
       const x2 = t.x;
-      const y2 = t.y + t.h / 2;
       const gap = Math.max(20, x2 - x1);
       const laneX = x1 + (gap * (i + 1)) / (n + 1);
       const pts: Pt[] = [
@@ -167,40 +206,44 @@ function buildGeometry(model: PipelineModel) {
 
   const maxBottom = Math.max(MARGIN + HEADER_BAND, ...[...placed.values()].map((b) => b.y + b.h));
   for (const group of side.values()) {
-    const n = group.length;
-    group.forEach((it, j) => {
-      const { s, t } = it;
-      const colLeft = s.x; // same column ⇒ s.x === t.x
-      const colRight = s.x + s.w;
-      const ySrc = s.y + s.h / 2;
-      const yTgt = t.y + t.h / 2;
-      const frac = (j + 1) / (n + 1);
-      const busR = colRight + COL_GAP * frac;
-      const busL = Math.max(MARGIN / 2, colLeft - COL_GAP * frac);
-      // Cross from the output (right) channel to the input (left) channel in the
-      // row-gap immediately next to the source, toward the target — i.e. as soon
-      // as possible — rather than detouring under the whole column. That gap is
-      // box-free across the full column width, so the cross-over never overlaps a
-      // box; the vertical runs stay in the side channels.
-      const crossY = yTgt > ySrc ? s.y + s.h + ROW_GAP / 2 : s.y - ROW_GAP / 2;
-      const pts: Pt[] = [
-        [colRight, ySrc], // leave source from the RIGHT
-        [busR, ySrc],
-        [busR, crossY],
-        [busL, crossY],
-        [busL, yTgt],
-        [colLeft, yTgt], // enter target from the LEFT
-      ];
-      edges.push({
-        key: `${it.e.source}->${it.e.target}`,
-        d: ortho(pts, CORNER_R),
-        source: it.e.source,
-        target: it.e.target,
-        label: it.e.label,
-        labelX: (busL + colLeft) / 2,
-        labelY: yTgt,
+    // Split by direction so down-going and up-going U-routes are laned (and
+    // cross-over-stacked) independently.
+    const down = group.filter((it) => it.y2 >= it.y1);
+    const up = group.filter((it) => it.y2 < it.y1);
+    const routeBundle = (bundle: Item[], dir: 1 | -1) => {
+      const n = bundle.length;
+      bundle.forEach((it, j) => {
+        const { s, t, y1: ySrc, y2: yTgt } = it;
+        const colLeft = s.x; // same column ⇒ s.x === t.x
+        const colRight = s.x + s.w;
+        const frac = (j + 1) / (n + 1);
+        const busR = colRight + COL_GAP * frac;
+        const busL = Math.max(MARGIN / 2, colLeft - COL_GAP * frac);
+        // Stack the cross-over levels in the row-gap next to the source so
+        // multiple U-routes never share the same horizontal line.
+        const base = dir > 0 ? s.y + s.h : s.y;
+        const crossY = base + dir * ((ROW_GAP * 0.35) + (ROW_GAP * 0.4 * j) / Math.max(1, n - 1 || 1));
+        const pts: Pt[] = [
+          [colRight, ySrc], // leave source from the RIGHT
+          [busR, ySrc],
+          [busR, crossY],
+          [busL, crossY],
+          [busL, yTgt],
+          [colLeft, yTgt], // enter target from the LEFT
+        ];
+        edges.push({
+          key: `${it.e.source}->${it.e.target}`,
+          d: ortho(pts, CORNER_R),
+          source: it.e.source,
+          target: it.e.target,
+          label: it.e.label,
+          labelX: (busL + colLeft) / 2,
+          labelY: yTgt,
+        });
       });
-    });
+    };
+    routeBundle(down, 1);
+    routeBundle(up, -1);
   }
 
   const height = maxBottom + MARGIN;
