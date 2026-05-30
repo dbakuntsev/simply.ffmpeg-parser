@@ -99,7 +99,7 @@ export function buildSemantic(
           token.normalizedText === "-af" ||
           token.normalizedText === "-filter_complex"
         ) {
-          const chains = token.normalizedText === "-filter_complex" ? parseFilterComplex(value.text) : undefined;
+          const chains = parseFilterComplex(value.text);
           filterGraphs.push({ id: `filter_${filterGraphs.length}`, expression: value.text, chains, valueTokenId: value.id });
           value.type = "filter";
         }
