@@ -123,6 +123,16 @@ export function buildSemantic(
         scope = inputIndex >= 0 ? "output" : "input";
       }
 
+      // ``-map`` is documented under "Advanced options" so the extractor tags
+      // it as ``global``, but its effect is per-output (each ``-map`` adds a
+      // stream to the *next* output file). Forcing output scope here lets
+      // pendingOutputs flush each ``-map`` onto its actual destination, so
+      // downstream routing (pipeline edge labels, selection) can tell which
+      // mapped pad feeds which output.
+      if (base === "-map") {
+        scope = "output";
+      }
+
       if (scope === "input") {
         if (hasSpecifier && inputIndex >= 0) {
           attachToInput(binding, inputIndex);

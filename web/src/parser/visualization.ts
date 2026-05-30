@@ -202,6 +202,10 @@ export interface PipelineBox {
 export interface PipelineEdge {
   source: string;
   target: string;
+  /** Pad label (e.g. ``LOW``, ``0:a``) when the edge carries a specific named
+   * or file-pad stream — used to disambiguate which output of a multi-output
+   * chain feeds which downstream box. Absent for auto-assigned/fan-out edges. */
+  label?: string;
 }
 
 export interface PipelineModel {
@@ -360,9 +364,9 @@ export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
         const file = FILE_PAD_RE.exec(pad);
         if (file) {
           const idx = Number(file[1]);
-          if (idx < demuxerIds.length) edges.push({ source: demuxerIds[idx], target: c.id });
+          if (idx < demuxerIds.length) edges.push({ source: demuxerIds[idx], target: c.id, label: pad });
         } else if (producerByPad.has(pad)) {
-          edges.push({ source: producerByPad.get(pad)!, target: c.id });
+          edges.push({ source: producerByPad.get(pad)!, target: c.id, label: pad });
         }
       });
     });
@@ -377,25 +381,26 @@ export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
     const terminalChains = chainBoxes.filter(
       (c) => c.outputPads.length === 0 || c.outputPads.some((p) => !consumedNamed.has(p))
     );
-    // ``-map`` is documented as a global option (the resolver classifies it as
-    // such), so look in both the output's own options and the globals pool.
+    // ``-map`` is special-cased to output scope in ``semantic.ts``, so each
+    // ``-map`` already lives on its destination output and we only need to
+    // inspect that output's own options here.
     const mapBindings = (output: SemanticCommand["outputs"][number]) =>
-      [...output.options, ...semantic.globals].filter(
+      output.options.filter(
         (opt) => splitStreamSpecifier(opt.flag.toLowerCase()).base === "-map"
       );
     semantic.outputs.forEach((output, j) => {
       const muxerId = `muxer_${j}`;
-      const mapped: string[] = [];
+      const mapped: Array<{ source: string; label: string }> = [];
       mapBindings(output).forEach((opt) =>
         opt.values.forEach((v) => {
           for (const m of v.matchAll(PAD_LABEL_RE)) {
             const src = producerByPad.get(m[1]);
-            if (src) mapped.push(src);
+            if (src) mapped.push({ source: src, label: m[1] });
           }
         })
       );
       if (mapped.length) {
-        mapped.forEach((src) => edges.push({ source: src, target: muxerId }));
+        mapped.forEach(({ source, label }) => edges.push({ source, target: muxerId, label }));
       } else {
         terminalChains.forEach((c) => edges.push({ source: c.id, target: muxerId }));
       }
@@ -414,14 +419,27 @@ export function buildPipelineModel(semantic: SemanticCommand): PipelineModel {
   // Dedupe parallel edges: a chain with input pads ``[0:1][0:2]…`` from the
   // same file would otherwise emit one edge per pad, all sharing the same
   // ``source->target`` key and confusing React's keyed reconciliation when the
-  // command changes (stale <path>s linger with bad geometry).
-  const seenEdges = new Set<string>();
-  const dedupedEdges = edges.filter((e) => {
+  // command changes (stale <path>s linger with bad geometry). When pad labels
+  // differ on collapsed edges (e.g. ``[0:v]`` + ``[0:a]`` from one demuxer),
+  // join them into a single comma-separated label so a single rail can carry
+  // the disambiguation without doubling up paths.
+  const edgeMap = new Map<string, PipelineEdge>();
+  for (const e of edges) {
     const key = `${e.source}->${e.target}`;
-    if (seenEdges.has(key)) return false;
-    seenEdges.add(key);
-    return true;
-  });
+    const existing = edgeMap.get(key);
+    if (!existing) {
+      edgeMap.set(key, { ...e });
+      continue;
+    }
+    if (e.label) {
+      const parts = existing.label ? existing.label.split(", ") : [];
+      if (!parts.includes(e.label)) {
+        parts.push(e.label);
+        existing.label = parts.join(", ");
+      }
+    }
+  }
+  const dedupedEdges = [...edgeMap.values()];
 
   return { boxes, edges: dedupedEdges };
 }

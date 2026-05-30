@@ -76,7 +76,17 @@ function boxHeight(box: PipelineBox): number {
   return TITLE_H + body;
 }
 
-type RoutedEdge = { key: string; d: string; source: string; target: string };
+type RoutedEdge = {
+  key: string;
+  d: string;
+  source: string;
+  target: string;
+  label?: string;
+  /** Anchor for the pad-label text — midpoint of the last horizontal segment
+   * (the one entering the target box from the left). */
+  labelX?: number;
+  labelY?: number;
+};
 
 const CORNER_R = 9;
 
@@ -143,7 +153,15 @@ function buildGeometry(model: PipelineModel) {
         [laneX, y2],
         [x2, y2],
       ];
-      edges.push({ key: `${it.e.source}->${it.e.target}`, d: ortho(pts, CORNER_R), source: it.e.source, target: it.e.target });
+      edges.push({
+        key: `${it.e.source}->${it.e.target}`,
+        d: ortho(pts, CORNER_R),
+        source: it.e.source,
+        target: it.e.target,
+        label: it.e.label,
+        labelX: (laneX + x2) / 2,
+        labelY: y2,
+      });
     });
   }
 
@@ -173,7 +191,15 @@ function buildGeometry(model: PipelineModel) {
         [busL, yTgt],
         [colLeft, yTgt], // enter target from the LEFT
       ];
-      edges.push({ key: `${it.e.source}->${it.e.target}`, d: ortho(pts, CORNER_R), source: it.e.source, target: it.e.target });
+      edges.push({
+        key: `${it.e.source}->${it.e.target}`,
+        d: ortho(pts, CORNER_R),
+        source: it.e.source,
+        target: it.e.target,
+        label: it.e.label,
+        labelX: (busL + colLeft) / 2,
+        labelY: yTgt,
+      });
     });
   }
 
@@ -337,6 +363,36 @@ export function PipelineChart({ model, selectedNode, onSelect }: Props) {
                 .map((p) => (
                   <path key={p.key} d={p.d} />
                 ))}
+            </g>
+
+            {/* pad labels on edges (e.g. ``LOW``, ``HIGH``, ``0:a``) — anchored
+                at the segment entering the target. White stroke halo so the
+                text remains readable when it sits above a rail line. */}
+            <g
+              fontSize={10}
+              fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+              textAnchor="middle"
+              style={{ paintOrder: "stroke" }}
+              stroke="#ffffff"
+              strokeWidth={3}
+              strokeLinejoin="round"
+            >
+              {edges
+                .filter((p) => p.label && p.labelX !== undefined && p.labelY !== undefined)
+                .map((p) => {
+                  const isActive = !!(activeBox && (p.source === activeBox || p.target === activeBox));
+                  return (
+                    <text
+                      key={`${p.key}-label`}
+                      x={p.labelX}
+                      y={p.labelY! - 4}
+                      fill={isActive ? "#0969da" : "#475569"}
+                      opacity={activeBox && !isActive ? 0.3 : 1}
+                    >
+                      {p.label}
+                    </text>
+                  );
+                })}
             </g>
 
             {/* boxes */}
