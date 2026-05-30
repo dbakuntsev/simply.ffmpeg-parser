@@ -22,11 +22,11 @@ For each selected tag, the extractor emits one JSON file per category under
 
 | File | Source(s) | Contents |
 |------|-----------|----------|
-| `options.json` | `doc/ffmpeg.texi`, falling back to `doc/ffmpeg-all.texi`, then `doc/ffmpeg-opt.texi` | Every documented CLI option: name, aliases, scope (global/input/output), valueType, accepted enum values, dependencies, conflicts, description, doc anchor |
+| `options.json` | `doc/ffmpeg.texi` (falling back to `doc/ffmpeg-all.texi`, then `doc/ffmpeg-opt.texi`) **+** `fftools/ffmpeg_opt.c`, `fftools/opt_common.h` / `fftools/cmdutils.h` | Every documented CLI option: name, aliases, scope (global/input/output), valueType, accepted enum values, dependencies, conflicts, description, doc anchor. The `fftools/` C sources are scanned to fold in short/legacy aliases (e.g. `-apre`/`-vpre`/`-spre` for `-pre`, `-stag` for `-tag`) and to synthesize entries for fully-undocumented options (e.g. `-hwaccel_output_format`) |
 | `codecs.json` | `doc/codecs.texi` + `libavcodec/allcodecs.c` (or `codec_list.c`) | Codec name, type (video/audio/subtitle), aliases, encoder/decoder flags |
 | `filters.json` | `doc/filters.texi` | Filter name, type, aliases, per-filter parameters and per-arg descriptions |
-| `muxers.json` | `doc/muxers.texi` | Muxer name, aliases, options |
-| `demuxers.json` | `doc/demuxers.texi` | Demuxer name, aliases, options |
+| `muxers.json` | `doc/muxers.texi` **+** `doc/outdevs.texi` | Muxer name, aliases, options. Output devices are merged in (libavdevice surfaces them as muxers at runtime), so `-f dshow`, `-f sdl`, etc. resolve |
+| `demuxers.json` | `doc/demuxers.texi` **+** `doc/indevs.texi` | Demuxer name, aliases, options. Input devices are merged in the same way, so `-f lavfi`, `-f gdigrab`, etc. resolve |
 | `protocols.json` | `doc/protocols.texi` | Protocol name, options |
 | `bitstream_filters.json` | `doc/bitstream_filters.texi` | Bitstream filter name, options |
 
@@ -96,6 +96,42 @@ Codecs that only appear in the C source (undocumented) are emitted with
 `type: "video"` as a default — the extractor does not try to infer type
 from the symbol name. If `codecs.texi` is missing but the C file exists,
 all codecs default to `type: "video"` and a warning is logged.
+
+### Augmenting `options.json` from the `fftools/` C sources
+
+The CLI option Texinfo (`doc/ffmpeg.texi` & friends) is a curated subset of
+FFmpeg's actual `OptionDef options[]` table. To close the gap, the extractor
+also parses `fftools/ffmpeg_opt.c` and `fftools/opt_common.h`
+(`fftools/cmdutils.h` on older tags) and folds two pieces of information into
+the doc-derived option list:
+
+- **Aliases for documented options.** Short/legacy names that share a backing
+  handler with a documented canonical (`apre`/`vpre`/`spre` for `pre`, `stag`
+  for `tag`, `scodec`/`dcodec` for `codec`, `lavfi` for `filter_complex` on
+  older tags, …) are attached to the canonical's `aliases` list.
+- **Top-level entries for fully-undocumented options.** Names in the C table
+  that are neither documented nor folded in as an alias get a synthesized
+  entry whose `scope` / `valueType` / `signature` are inferred from the
+  `OPT_*` flag tokens on the row, and whose `description` is the row's short
+  C help string. `-hwaccel_output_format` is the canonical example.
+
+Both passes are gap-fill only: a name that has a doc-derived entry always
+keeps its richer description. If every `fftools/` source fails to fetch for
+a given tag, augmentation is silently skipped and the doc-derived list is
+emitted unchanged.
+
+### Devices folded into demuxers/muxers
+
+FFmpeg's `-f <name>` is a single flag that selects either a (de)muxer or a
+device — at runtime libavdevice surfaces input devices through the demuxer
+API and output devices through the muxer API. Treating devices as separate
+output categories would force the SPA to special-case `-f lavfi`, `-f dshow`,
+`-f gdigrab`, etc. Instead, `doc/indevs.texi` is parsed and merged into
+`demuxers.json`, and `doc/outdevs.texi` into `muxers.json`. On name
+collisions (e.g. `fbdev` is documented as both an indev and an outdev), the
+demuxer/muxer entry wins; device-only entries land with an empty `options`
+list. The SPA's `unknown-demuxer` / `unknown-muxer` diagnostics rely on this
+merge.
 
 ## How HTML documentation is built
 

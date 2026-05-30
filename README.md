@@ -25,20 +25,25 @@ FFmpeg sources by a companion Python CLI.
   the current command against that version's option/filter set.
 - **Live analysis.** The textarea auto-analyzes after a short debounce, so
   edits are reflected immediately without a button click.
-- **Flow chart.** A D3-powered diagram of inputs → filters → outputs, with
-  edges following the actual stream routing implied by `-map`,
-  `-filter_complex` labels, and per-output options.
+- **Pipeline chart.** A railroad-style diagram with five stage columns
+  (input → demuxer → transform → muxer → output) that traces the
+  processing pipeline implied by `-map`, `-filter_complex` labels, file
+  pads (`0:v`), and per-output options. Rails carry stream-type labels
+  where the routing makes them inferrable.
 - **Tree list.** A structured view of every parsed token grouped by scope
   (globals, per-input, per-output, per-filter-chain).
 - **Inspector drawer.** Click any node in the chart or tree to open a
   side-drawer (or modal on smaller screens) with the option's official
   description, accepted values, scope, and a link into the rendered FFmpeg
-  HTML reference for that exact version.
+  HTML reference for that exact version. Selecting a node also highlights
+  the matching span in the command textarea (offset-aware — it sees through
+  quotes into filtergraph args) and scrolls it into view.
 - **Diagnostics panel.** Per-token warnings and errors with click-to-jump
   highlighting back into the textarea.
-- **Filter parsing.** `-filter_complex` expressions are split into chains
-  and arguments (quote- and paren-depth aware); `-vf` / `-af` are recognized
-  as filter graphs without further decomposition.
+- **Filter parsing.** `-filter_complex`, `-vf`, `-af`, and `-lavfi` are
+  all parsed as filtergraphs with the same offset-aware decomposition into
+  chains, steps, and arguments — quote-, paren-, and escape-aware, with
+  support for both single and double quotes.
 
 ## Repo layout
 

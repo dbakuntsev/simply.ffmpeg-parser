@@ -2,6 +2,14 @@
 
 CLI utility for generating FFmpeg metadata bundles used by the Simply.ffmpeg-parser SPA.
 
+For the user-facing overview — installation, what gets extracted into each
+JSON bundle (options, codecs, filters, muxers/demuxers including devices,
+protocols, bitstream filters), how the deploy workflow wires it up, and the
+cache-buster scheme — see [`../METADATA_EXTRACTOR.md`](../METADATA_EXTRACTOR.md).
+This file focuses on the build-time HTML rendering pipeline (pinned-tag fetch
+of `t2h.pm` + CSS, the `href` repoints) since that is the part with
+non-obvious mechanics worth documenting in-package.
+
 ## Usage
 
 ```bash
